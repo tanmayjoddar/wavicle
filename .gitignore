@@ -1,0 +1,7 @@
+*.log
+*.exe
+bench_test.exe
+.DS_Store
+Thumbs.db
+ll.md
+prmpt.md
