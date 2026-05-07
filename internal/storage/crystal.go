@@ -1,0 +1,229 @@
+package storage
+
+import (
+	"crypto/rand"
+	"fmt"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+	"wavicle/internal/core"
+)
+
+// CausalCrystal is Wavicle's storage engine.
+type CausalCrystal struct {
+	// Persistent storage
+	wal *WAL
+
+	// Hot indexes (RAM)
+	frontier    *FrontierIndex
+	parentIndex *ParentIndex
+	depthIndex  sync.Map // atom_hash -> causal_depth
+	atomCache   sync.Map // atom_hash -> *core.CausalAtom
+
+	// Merkle tree for cryptographic verification
+	merkle     *MerkleTree
+	merkleRoot atomic.Value // core.Hash
+
+	// Logical clock for total ordering
+	clock atomic.Uint64
+
+	mu sync.RWMutex
+}
+
+func NewCausalCrystal(walPath string) (*CausalCrystal, error) {
+	wal, err := NewWAL(walPath)
+	if err != nil {
+		return nil, err
+	}
+
+	c := &CausalCrystal{
+		wal:         wal,
+		frontier:    NewFrontierIndex(),
+		parentIndex: NewParentIndex(),
+		merkle:      NewMerkleTree(),
+	}
+
+	if err := c.Recover(); err != nil {
+		return nil, fmt.Errorf("recovery: %w", err)
+	}
+
+	return c, nil
+}
+
+func (c *CausalCrystal) Recover() error {
+	atoms, err := c.wal.ReadAll()
+	if err != nil {
+		return err
+	}
+
+	for _, atom := range atoms {
+		c.frontier.Set(atom.Path, atom.Hash)
+		c.parentIndex.Set(atom.Hash, atom.CausalPast)
+		c.depthIndex.Store(atom.Hash, atom.CausalDepth)
+		c.atomCache.Store(atom.Hash, atom)
+		c.merkle.Insert(atom.Hash)
+		c.merkleRoot.Store(c.merkle.Root())
+		if atom.LogicalClock > c.clock.Load() {
+			c.clock.Store(atom.LogicalClock)
+		}
+	}
+
+	return nil
+}
+
+func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causalPast []core.Hash) (core.Hash, error) {
+	// Step 1: Determine causal depth
+	depth := uint64(0)
+	for _, parentHash := range causalPast {
+		if d, ok := c.depthIndex.Load(parentHash); ok {
+			if d.(uint64)+1 > depth {
+				depth = d.(uint64) + 1
+			}
+		}
+	}
+
+	// Step 2: Build atom
+	atom := &core.CausalAtom{
+		Expr:         expr,
+		CausalPast:   causalPast,
+		CausalDepth:  depth,
+		Vector:       embedExpression(expr),
+		Domain:       inferDomain(path),
+		LogicalClock: c.clock.Add(1),
+		PhysicalTime: time.Now(),
+		Nonce:        randomNonce(),
+		Path:         path, // Populate Path for recovery
+	}
+	atom.Hash = atom.ComputeHash()
+
+	// Step 3: fdatasync to WAL
+	if err := c.wal.Append(atom); err != nil {
+		return core.Hash{}, fmt.Errorf("wal append: %w", err)
+	}
+
+	// Step 4: Update hot indexes
+	c.frontier.Set(path, atom.Hash)
+	c.parentIndex.Set(atom.Hash, causalPast)
+	c.depthIndex.Store(atom.Hash, depth)
+	c.atomCache.Store(atom.Hash, atom)
+
+	// Step 5: Update Merkle tree
+	c.mu.Lock()
+	c.merkle.Insert(atom.Hash)
+	c.merkleRoot.Store(c.merkle.Root())
+	c.mu.Unlock()
+
+	return atom.Hash, nil
+}
+
+func (c *CausalCrystal) GetCurrent(path string) (*core.CausalAtom, bool) {
+	hash, ok := c.frontier.Get(path)
+	if !ok {
+		return nil, false
+	}
+	return c.GetAtomByHash(hash)
+}
+
+func (c *CausalCrystal) GetCurrentHash(path string) (core.Hash, bool) {
+	return c.frontier.Get(path)
+}
+
+func (c *CausalCrystal) GetAtomByHash(hash core.Hash) (*core.CausalAtom, bool) {
+	if atom, ok := c.atomCache.Load(hash); ok {
+		return atom.(*core.CausalAtom), true
+	}
+	return nil, false
+}
+
+func (c *CausalCrystal) VerifyVersionVector(entries map[string]core.Hash) bool {
+	for path, expectedHash := range entries {
+		currentHash, ok := c.GetCurrentHash(path)
+		if !ok || currentHash != expectedHash {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *CausalCrystal) FindChangedPaths(entries map[string]core.Hash) []string {
+	var changed []string
+	for path, expectedHash := range entries {
+		currentHash, ok := c.GetCurrentHash(path)
+		if !ok || currentHash != expectedHash {
+			changed = append(changed, path)
+		}
+	}
+	return changed
+}
+
+func (c *CausalCrystal) MerkleRootForPaths(paths []string) core.Hash {
+	if len(paths) == 0 {
+		return core.Hash{}
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var hashes []core.Hash
+	for _, p := range paths {
+		if h, ok := c.frontier.Get(p); ok {
+			hashes = append(hashes, h)
+		} else {
+			// If a path doesn't exist, we use a zero hash as a placeholder
+			hashes = append(hashes, core.Hash{})
+		}
+	}
+
+	// Sort hashes for stable Merkle root regardless of path order
+	sort.Slice(hashes, func(i, j int) bool {
+		for k := 0; k < 32; k++ {
+			if hashes[i][k] != hashes[j][k] {
+				return hashes[i][k] < hashes[j][k]
+			}
+		}
+		return false
+	})
+
+	return c.merkle.computeRoot(hashes)
+}
+
+func (c *CausalCrystal) CaptureVersionVector(paths []string) map[string]core.Hash {
+	res := make(map[string]core.Hash)
+	for _, p := range paths {
+		if h, ok := c.frontier.Get(p); ok {
+			res[p] = h
+		}
+	}
+	return res
+}
+
+func (c *CausalCrystal) GetParents(hash core.Hash) ([]core.Hash, bool) {
+	return c.parentIndex.Get(hash)
+}
+
+func (c *CausalCrystal) FrontierPaths() []string {
+	return c.frontier.Paths()
+}
+
+func (c *CausalCrystal) Close() error {
+	return c.wal.Close()
+}
+
+// Helpers
+
+func embedExpression(expr core.CombinatorExpr) core.Vector {
+	// Mock implementation
+	return core.Vector{}
+}
+
+func inferDomain(path string) core.Domain {
+	// Simple domain inference based on path prefix
+	return core.DomainSystem
+}
+
+func randomNonce() [16]byte {
+	var n [16]byte
+	rand.Read(n[:])
+	return n
+}
