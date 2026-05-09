@@ -1,0 +1,306 @@
+package core
+
+import (
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"golang.org/x/crypto/sha3"
+)
+
+// Hash is a 32-byte SHA3-256 content address.
+type Hash [32]byte
+
+func (h Hash) String() string {
+	return fmt.Sprintf("%x", h[:])
+}
+
+func (h Hash) IsZero() bool {
+	return h == Hash{}
+}
+
+// Domain categorizes atoms for sharding and policy routing
+type Domain uint8
+
+const (
+	DomainUser Domain = iota
+	DomainOrder
+	DomainProduct
+	DomainSession
+	DomainConfig
+	DomainAnalytics
+	DomainSystem
+)
+
+// ObservationMode controls the precision/speed tradeoff per query
+type ObservationMode uint8
+
+const (
+	ModeDeductive ObservationMode = iota
+	ModeInductive
+	ModeAbductive
+	ModeIntuitive
+)
+
+func (m ObservationMode) Strictness() int {
+	return int(m)
+}
+
+// Vector is a 256-dimensional semantic embedding
+type Vector [256]float32
+
+// Value is the universal sum type for all atom values
+type Value interface {
+	valueTag()
+	Serialize() []byte
+	Type() string
+}
+
+type VNull struct{}
+
+func (v VNull) valueTag()        {}
+func (v VNull) Type() string     { return "null" }
+func (v VNull) Serialize() []byte { return []byte{0} }
+
+type VBool bool
+
+func (v VBool) valueTag()        {}
+func (v VBool) Type() string     { return "bool" }
+func (v VBool) Serialize() []byte {
+	if v {
+		return []byte{1}
+	}
+	return []byte{2}
+}
+
+type VInt int64
+
+func (v VInt) valueTag()        {}
+func (v VInt) Type() string     { return "int" }
+func (v VInt) Serialize() []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(v))
+	return b
+}
+
+type VFloat float64
+
+func (v VFloat) valueTag()        {}
+func (v VFloat) Type() string     { return "float" }
+func (v VFloat) Serialize() []byte {
+	// Simple mock serialization for now, can use math.Float64bits
+	return []byte(fmt.Sprintf("%f", v))
+}
+
+type VString string
+
+func (v VString) valueTag()        {}
+func (v VString) Type() string     { return "string" }
+func (v VString) Serialize() []byte { return []byte(v) }
+
+type VBytes []byte
+
+func (v VBytes) valueTag()        {}
+func (v VBytes) Type() string     { return "bytes" }
+func (v VBytes) Serialize() []byte { return v }
+
+type VArray []Value
+
+func (v VArray) valueTag()    {}
+func (v VArray) Type() string { return "array" }
+func (v VArray) Serialize() []byte {
+	var b []byte
+	for _, val := range v {
+		b = append(b, val.Serialize()...)
+	}
+	return b
+}
+
+type VRecord map[string]Value
+
+func (v VRecord) valueTag()    {}
+func (v VRecord) Type() string { return "record" }
+func (v VRecord) Serialize() []byte {
+	// Sort keys for deterministic serialization would be better
+	var b []byte
+	for k, val := range v {
+		b = append(b, []byte(k)...)
+		b = append(b, val.Serialize()...)
+	}
+	return b
+}
+
+// CombinatorExpr is the stratified typed algebra.
+type CombinatorExpr interface {
+	exprTag()
+	Level() int
+	ExprHash() Hash
+	Serialize() []byte
+}
+
+type EConst struct{ Value Value }
+
+func (e *EConst) exprTag()    {}
+func (e *EConst) Level() int { return 0 }
+func (e *EConst) Serialize() []byte {
+	return append([]byte{0}, e.Value.Serialize()...)
+}
+func (e *EConst) ExprHash() Hash {
+	return sha3.Sum256(e.Serialize())
+}
+
+type EFieldAccess struct {
+	Field  string
+	Source CombinatorExpr
+}
+
+func (e *EFieldAccess) exprTag()    {}
+func (e *EFieldAccess) Level() int { return 1 }
+func (e *EFieldAccess) Serialize() []byte {
+	return append(append([]byte{1}, []byte(e.Field)...), e.Source.Serialize()...)
+}
+func (e *EFieldAccess) ExprHash() Hash {
+	return sha3.Sum256(e.Serialize())
+}
+
+type EEmbed struct {
+	ModelVersion uint16
+	Vector       Vector
+}
+
+func (e *EEmbed) exprTag()    {}
+func (e *EEmbed) Level() int { return 1 }
+func (e *EEmbed) Serialize() []byte {
+	// ... implementation
+	return []byte{2}
+}
+func (e *EEmbed) ExprHash() Hash {
+	return sha3.Sum256(e.Serialize())
+}
+
+type ECompose struct {
+	Atoms []Hash
+}
+
+func (e *ECompose) exprTag()    {}
+func (e *ECompose) Level() int { return 2 }
+func (e *ECompose) Serialize() []byte {
+	b := []byte{3}
+	for _, h := range e.Atoms {
+		b = append(b, h[:]...)
+	}
+	return b
+}
+func (e *ECompose) ExprHash() Hash {
+	return sha3.Sum256(e.Serialize())
+}
+
+type EApply struct {
+	Func CombinatorExpr
+	Arg  CombinatorExpr
+}
+
+func (e *EApply) exprTag()    {}
+func (e *EApply) Level() int { return 2 }
+func (e *EApply) Serialize() []byte {
+	return append(append([]byte{4}, e.Func.Serialize()...), e.Arg.Serialize()...)
+}
+func (e *EApply) ExprHash() Hash {
+	return sha3.Sum256(e.Serialize())
+}
+
+type EResonate struct {
+	Queries []Vector
+}
+
+func (e *EResonate) exprTag()    {}
+func (e *EResonate) Level() int { return 3 }
+func (e *EResonate) Serialize() []byte {
+	return []byte{5}
+}
+func (e *EResonate) ExprHash() Hash {
+	return sha3.Sum256(e.Serialize())
+}
+
+// CausalAtom is the immutable, content-addressed unit of truth.
+type CausalAtom struct {
+	Hash         Hash
+	Expr         CombinatorExpr
+	CausalPast   []Hash
+	CausalDepth  uint64
+	Vector       Vector
+	Domain       Domain
+	LogicalClock uint64
+	PhysicalTime time.Time
+	Nonce        [16]byte
+	BranchID     [16]byte
+	Path         string // Added for recovery
+}
+
+func (a *CausalAtom) ComputeHash() Hash {
+	h := sha3.New256()
+	h.Write(a.Expr.Serialize())
+	binary.Write(h, binary.BigEndian, a.LogicalClock)
+	binary.Write(h, binary.BigEndian, uint64(a.PhysicalTime.UnixNano()))
+	h.Write(a.Nonce[:])
+	h.Write(a.BranchID[:])
+	binary.Write(h, binary.BigEndian, uint32(len(a.CausalPast)))
+	for _, p := range a.CausalPast {
+		h.Write(p[:])
+	}
+	var hash Hash
+	copy(hash[:], h.Sum(nil))
+	return hash
+}
+
+func HashValue(v Value) Hash {
+	return sha3.Sum256(v.Serialize())
+}
+
+func HashBytes(data []byte) Hash {
+	return sha3.Sum256(data)
+}
+
+// UnmarshalJSON implements custom unmarshalling to handle the Expr interface.
+func (a *CausalAtom) UnmarshalJSON(data []byte) error {
+	type Alias CausalAtom
+	aux := &struct {
+		Expr json.RawMessage `json:"Expr"`
+		*Alias
+	}{
+		Alias: (*Alias)(a),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	// Try to determine the concrete type of Expr
+	// For now, only EConst is fully supported in SET commands
+	var eConst EConst
+	if err := json.Unmarshal(aux.Expr, &eConst); err == nil && eConst.Value != nil {
+		a.Expr = &eConst
+		return nil
+	}
+
+	// Add more types as needed for recovery
+	return fmt.Errorf("unknown or unsupported Expr type in JSON")
+}
+
+// EConst needs special handling for Value interface too
+func (e *EConst) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		Value interface{} `json:"Value"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	// For simplicity in the prototype, treat all values as VString
+	if s, ok := aux.Value.(string); ok {
+		e.Value = VString(s)
+	} else {
+		// Fallback for non-string values if any
+		e.Value = VNull{}
+	}
+	return nil
+}
