@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
 	"wavicle/internal/protocol/resp3"
 	"wavicle/internal/storage"
 )
@@ -10,10 +11,15 @@ import (
 func main() {
 	fmt.Println("Wavicle Causal Proof Engine v1.0 starting...")
 
-	crystal, err := storage.NewCausalCrystal("crystal.log")
+	if err := os.MkdirAll("data", 0755); err != nil {
+		log.Fatalf("Failed to create data directory: %v", err)
+	}
+
+	crystal, err := storage.NewCausalCrystal("data/crystal.log")
 	if err != nil {
 		log.Fatalf("Failed to initialize Causal Crystal: %v", err)
 	}
+	defer crystal.Close()
 
 	server := resp3.NewServer(crystal)
 

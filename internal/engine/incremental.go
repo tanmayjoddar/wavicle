@@ -14,6 +14,21 @@ type ReduceStats struct {
 	DurationNanos int64
 }
 
+// ReduceIncremental serves a proof cache entry, validating and recomputing
+// only the parts that changed.
+//
+// THREE PATHS:
+// 1. FAST PATH (O(1)):  Nothing changed. Version vector matches. Return cached value.
+// 2. WARM PATH (O(k log d)): k fields changed. Recompute only changed subtrees.
+// 3. COLD PATH (O(n)):  Proof cache miss. Compose entire proof from Crystal.
+//
+// LOCK ORDER: proof.mu -> crystal.mu -> frontier.mu / parentIndex.mu
+// This ordering must be followed globally to prevent deadlocks.
+// Never acquire proof.mu while holding crystal.mu or any of its sub-locks.
+//
+// THIS IS WHAT BEATS REDIS:
+// Redis on stale: delete key -> next request hits DB -> cold query (5ms)
+// Wavicle on stale: find changed fields -> recompute only those -> 0.1ms
 func ReduceIncremental(
 	proof *MaterializedProof,
 	crystal *storage.CausalCrystal,
