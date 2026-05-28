@@ -7,21 +7,24 @@ import (
 	"wavicle/internal/storage"
 )
 
-func ComposeProof(crystal *storage.CausalCrystal, path string, mode core.ObservationMode) (*MaterializedProof, error) {
-	relevantAtoms, err := gatherCausalClosure(crystal, path)
+func ComposeProof(store storage.Store, path string, mode core.ObservationMode) (*MaterializedProof, error) {
+	relevantAtoms, err := gatherCausalClosure(store, path)
 	if err != nil {
 		return nil, fmt.Errorf("causal closure: %w", err)
 	}
 
-	proofTree := buildProofTree(crystal, relevantAtoms, path)
+	proofTree := buildProofTree(store, relevantAtoms, path)
 
-	value, nodeCache, err := ReduceProofTree(proofTree, crystal)
+	value, nodeCache, err := ReduceProofTree(proofTree, store)
 	if err != nil {
 		return nil, fmt.Errorf("reduce proof tree: %w", err)
 	}
 
-	vv := captureVersionVector(crystal, relevantAtoms)
-	merkleRoot := ComputeVersionMerkleRoot(vv, crystal)
+	vv := captureVersionVector(store, relevantAtoms)
+	var merkleRoot core.Hash
+	if crystal, ok := store.(*storage.CausalCrystal); ok {
+		merkleRoot = ComputeVersionMerkleRoot(vv, crystal)
+	}
 
 	pathToExpr := make(map[string]core.Hash)
 	for _, a := range relevantAtoms {
@@ -46,7 +49,7 @@ func ComposeProof(crystal *storage.CausalCrystal, path string, mode core.Observa
 	}, nil
 }
 
-func gatherCausalClosure(crystal *storage.CausalCrystal, path string) ([]*core.CausalAtom, error) {
+func gatherCausalClosure(crystal storage.Store, path string) ([]*core.CausalAtom, error) {
 	seen := make(map[core.Hash]bool)
 	var collect func(h core.Hash)
 	collect = func(h core.Hash) {
@@ -74,14 +77,14 @@ func gatherCausalClosure(crystal *storage.CausalCrystal, path string) ([]*core.C
 
 	var atoms []*core.CausalAtom
 	for h := range seen {
-		if a, ok := crystal.GetAtomByHash(h); ok {
+		if a, ok := crystal.GetAtom(h); ok {
 			atoms = append(atoms, a)
 		}
 	}
 	return atoms, nil
 }
 
-func buildProofTree(crystal *storage.CausalCrystal, atoms []*core.CausalAtom, primaryPath string) core.CombinatorExpr {
+func buildProofTree(crystal storage.Store, atoms []*core.CausalAtom, primaryPath string) core.CombinatorExpr {
 	hashes := make([]core.Hash, 0, len(atoms))
 	seen := make(map[core.Hash]bool)
 	for _, a := range atoms {
@@ -93,7 +96,7 @@ func buildProofTree(crystal *storage.CausalCrystal, atoms []*core.CausalAtom, pr
 	return &core.ECompose{Atoms: hashes}
 }
 
-func ReduceProofTree(expr core.CombinatorExpr, crystal *storage.CausalCrystal) (core.Value, map[core.Hash]core.Value, error) {
+func ReduceProofTree(expr core.CombinatorExpr, crystal storage.Store) (core.Value, map[core.Hash]core.Value, error) {
 	cache := make(map[core.Hash]core.Value)
 	value, err := reduceTree(expr, crystal, cache, nil)
 	if err != nil {
@@ -102,7 +105,7 @@ func ReduceProofTree(expr core.CombinatorExpr, crystal *storage.CausalCrystal) (
 	return value, cache, nil
 }
 
-func captureVersionVector(crystal *storage.CausalCrystal, atoms []*core.CausalAtom) *VersionVector {
+func captureVersionVector(crystal storage.Store, atoms []*core.CausalAtom) *VersionVector {
 	entries := make(map[string]core.Hash)
 	for _, a := range atoms {
 		if a.Path != "" {
