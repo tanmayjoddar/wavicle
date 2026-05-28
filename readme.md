@@ -46,7 +46,7 @@ Some sync    → keeps them in sync  (another system to maintain)
 ```mermaid
 graph TB
     subgraph "Client Layer"
-        RC["redis-cli / any RESP3 client"]
+        RC["wavicle-cli / any RESP3 client"]
     end
 
     subgraph "Protocol Tier — RESP3 Server"
@@ -121,22 +121,20 @@ ReduceIncremental(proof, crystal):
 ```bash
 # Build
 go build -o wavicle .
+go build -o wavicle-cli ./cmd/wavicle-cli/
 
-# Run (RESP3 wire protocol server on :6379)
+# Start the Wavicle server (RESP3 wire protocol on :6379)
 ./wavicle
 
-# In another terminal — use any RESP3-compatible client:
-redis-cli SET user:123:name "Alice"
-# +OK
+# In another terminal — use the Wavicle CLI:
+./wavicle-cli SET user:123:name "Alice"
+# OK
 
-redis-cli GET user:123:name
+./wavicle-cli GET user:123:name
 # "Alice"
 
-redis-cli EXISTS user:123:name
+./wavicle-cli EXISTS user:123:name
 # (integer) 1
-
-redis-cli DBSIZE
-# (integer) 3
 ```
 
 ### Run Tests
@@ -206,7 +204,7 @@ All three correctness tests pass — proving **zero stale reads under mutation**
 | `EXISTS key [keys...]` | ✅ | Frontier lookup |
 | `DBSIZE` | ✅ | Frontier entry count |
 
-Wire protocol: **RESP3** (inline commands + RESP arrays). Works with `redis-cli`, `go-redis`, `ioredis`, and any RESP3-compatible client.
+Wire protocol: **RESP3** (inline commands + RESP arrays). Wavicle includes its own `wavicle-cli` tool. Also works with any RESP3-compatible client (`go-redis`, `ioredis`, etc.).
 
 ---
 
@@ -214,7 +212,8 @@ Wire protocol: **RESP3** (inline commands + RESP arrays). Works with `redis-cli`
 
 ```
 wavicle/
-├── main.go                              # Entry point
+├── main.go                              # Server entry point
+├── cmd/wavicle-cli/main.go              # CLI client entry point
 ├── internal/
 │   ├── core/types.go                    # Hash, Value, CombinatorExpr, CausalAtom
 │   ├── storage/
