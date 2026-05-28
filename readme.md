@@ -19,11 +19,11 @@ Every cached value keeps a receipt of what it depends on. When data changes, the
 
 ## What Wavicle Is
 
-Wavicle is a **proof-based caching layer** that sits between your application and your database. It speaks the RESP3 protocol (Redis-compatible) so existing apps need zero code changes. The value is in the algorithm:
+Wavicle is a **proof-based caching layer** that sits between your application and your database. It speaks the RESP3 wire protocol so existing apps need zero code changes. The value is in the algorithm:
 
 - **No stale reads** — every cached proof carries a version vector. On each read, the cache proves its own freshness by checking every dependency against the source of truth.
 - **Incremental recomputation** — when data changes, only the affected cached expressions are recomputed, not the entire cache entry.
-- **Drop-in Redis protocol** — any Redis client talks to it natively.
+- **Drop-in RESP3 protocol** — any RESP3-compatible client talks to it natively.
 
 **Wavicle does not replace your database.** It makes your existing database faster by eliminating cache invalidation — the hardest problem in caching.
 
@@ -158,7 +158,7 @@ The 48x speedup comes from the node cache: 49 of 50 unchanged atoms are served i
 | `EXISTS key [keys...]` | `(integer) N` | Count of live keys |
 | `DBSIZE` | `(integer) N` | Count of live frontier entries |
 
-Wire protocol is **RESP3 — Redis-compatible**. Wavicle includes its own `wavicle-cli` tool, but any RESP3 client can connect.
+Wire protocol is **RESP3**. Wavicle includes its own `wavicle-cli` tool, but any RESP3-compatible client can connect.
 
 ---
 
@@ -190,7 +190,7 @@ Three tests prove zero stale reads under mutation. All pass.
 ## When to Use Wavicle
 
 ### Good fit
-- **Read-heavy API backends** currently using Redis + PostgreSQL with manual invalidation logic
+- **Read-heavy API backends** with manual cache invalidation pain
 - **Composite object caching** where a single GET returns data assembled from multiple sources
 - **Session storage** where TTL-based approaches are error-prone
 - Any scenario where **stale reads are unacceptable** (fintech, compliance)
