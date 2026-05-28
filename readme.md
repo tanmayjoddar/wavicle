@@ -31,9 +31,9 @@ Wavicle is a **proof-based caching layer** that sits between your application an
 
 ## Architecture
 
-### Current — Standalone Prototype
+### Current — Development Mode
 
-Wavicle currently ships with its own storage engine (Causal Crystal) for self-contained development and testing. This is where the algorithm was validated.
+Wavicle includes a built-in development storage (Causal Crystal) so you can run and test it immediately. This is where the algorithm was validated.
 
 ```mermaid
 graph TB
@@ -103,7 +103,7 @@ graph TB
 go build -o wavicle .
 go build -o wavicle-cli ./cmd/wavicle-cli/
 
-# Start Wavicle (standalone mode — uses Causal Crystal)
+# Start Wavicle
 ./wavicle
 
 # In another terminal:
@@ -126,7 +126,7 @@ $ ./wavicle-cli GET user:name
 (nil)
 ```
 
-Wavicle comes with its own built-in storage (Causal Crystal) so you can run it immediately with zero setup. No external dependencies required.
+These commands work out of the box with no external setup. The Quick Start uses a built-in development storage so you can evaluate the proof engine immediately. For production, Wavicle connects to your existing database and all SET/GET/DEL operations pass through to it — see the Architecture section above.
 
 ---
 
@@ -235,7 +235,7 @@ Three tests prove zero stale reads under mutation. All pass.
 | **2 — Production Ready** | Ship to design partners | Hash data type, TTL, MGET/MSET, Prometheus metrics, auth, 7-day soak test | **H1 2027** |
 | **3 — Enterprise** | Scale and sell | Multi-DB support, RBAC, SSO, audit, cloud marketplace | **H2 2027** |
 
-**The Causal Crystal** (standalone storage engine) was Phase 0 infrastructure used to validate the algorithm. In production deployment, Wavicle attaches to your existing database. The Causal Crystal remains available for development, testing, and embedded use cases.
+**The Causal Crystal** is the built-in development storage — it was used to validate the algorithm during Phase 0. In production deployment, Wavicle connects to your existing database. The Causal Crystal remains available for development, testing, and single-node embedded use cases.
 
 ---
 
