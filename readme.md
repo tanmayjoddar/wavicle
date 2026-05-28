@@ -39,41 +39,77 @@ This isn't a radical idea. It's just applying content-addressed caching to the d
 go build -o wavicle .
 go build -o wavicle-cli ./cmd/wavicle-cli/
 
-# Start Wavicle (RESP3 wire protocol on :6379)
+# Start Wavicle
 ./wavicle
 
-# In another terminal — all 6 commands, running against Wavicle:
+# In another terminal:
 ```
 
 ```
+$ ./wavicle-cli --version
+wavicle-cli 1.0.0
+
 $ ./wavicle-cli PING
 PONG
 
-$ ./wavicle-cli SET user:123:name "Alice"
+$ ./wavicle-cli DBSIZE
+(integer) 0
+
+$ ./wavicle-cli SET user:name "Alice"
 OK
 
-$ ./wavicle-cli GET user:123:name
+$ ./wavicle-cli GET user:name
 Alice
 
-$ ./wavicle-cli EXISTS user:123:name
+$ ./wavicle-cli EXISTS user:name
 (integer) 1
 
 $ ./wavicle-cli DBSIZE
 (integer) 1
 
-$ ./wavicle-cli DEL user:123:name
+$ ./wavicle-cli SET user:email "alice@test.com"
+OK
+
+$ ./wavicle-cli DBSIZE
+(integer) 2
+
+$ ./wavicle-cli DEL user:email
 (integer) 1
 
-# After deletion, the key returns nil and no longer exists:
-$ ./wavicle-cli EXISTS user:123:name
+$ ./wavicle-cli EXISTS user:email
 (integer) 0
 
-$ ./wavicle-cli GET user:123:name
+$ ./wavicle-cli GET user:email
 (nil)
 
-# Missing keys also return nil:
+$ ./wavicle-cli DBSIZE
+(integer) 1
+
+$ ./wavicle-cli DEL user:name
+(integer) 1
+
+$ ./wavicle-cli DBSIZE
+(integer) 0
+
 $ ./wavicle-cli GET nonexistent
 (nil)
+```
+
+Interactive REPL mode — just run without arguments:
+
+```bash
+$ ./wavicle-cli
+wavicle-cli 1.0.0
+Type "exit" or "quit" to quit, "help" for commands.
+Connecting to localhost:6379...
+Connected.
+
+wavicle> SET user:name "Alice"
+OK
+wavicle> GET user:name
+Alice
+wavicle> exit
+Bye.
 ```
 
 ---
@@ -187,7 +223,7 @@ All 6 commands work against Wavicle's own storage engine. Every SET appends an i
 | `DEL` | `DEL key` | `(integer) N` | Appends tombstone atom |
 | `DBSIZE` | `DBSIZE` | `(integer) N` | Count of live frontier entries |
 
-Wire protocol is **RESP3** — the same protocol Redis speaks. Wavicle includes its own `wavicle-cli` tool, but any RESP3-compatible client can connect.
+Wire protocol is **RESP3**. Wavicle includes its own `wavicle-cli` tool, but any RESP3-compatible client can connect.
 
 ---
 
@@ -211,7 +247,7 @@ wavicle/
 ├── main_test.go                               # End-to-end RESP3 test
 │
 ├── cmd/
-│   └── wavicle-cli/main.go                    # CLI client (146 lines)
+│   └── wavicle-cli/main.go                    # CLI client (REPL, RESP3 formatting)
 │
 ├── internal/
 │   ├── core/
