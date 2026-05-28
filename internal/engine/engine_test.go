@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"wavicle/internal/core"
 	"wavicle/internal/storage"
@@ -14,10 +15,11 @@ func TestIncrementalCorrectness_PoisonWrite(t *testing.T) {
 	//   2. Change 1 field (poison write)
 	//   3. Incremental read — must return NEW value for changed field
 
-	crystal, err := storage.NewCausalCrystal("test_poison.log")
+	crystal, err := storage.NewCausalCrystal(filepath.Join(t.TempDir(), "test_poison.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer crystal.Close()
 
 	var atoms []core.Hash
 	entries := make(map[string]core.Hash)
@@ -103,10 +105,11 @@ func TestIncrementalCorrectness_PoisonWrite(t *testing.T) {
 }
 
 func TestReadAfterWrite_ReturnsLatestValue(t *testing.T) {
-	crystal, err := storage.NewCausalCrystal("test_rw.log")
+	crystal, err := storage.NewCausalCrystal(filepath.Join(t.TempDir(), "test_rw.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer crystal.Close()
 
 	_, err = crystal.AppendAtom(
 		&core.EConst{Value: core.VString("Alice")},
@@ -160,10 +163,11 @@ func TestReadAfterWrite_ReturnsLatestValue(t *testing.T) {
 }
 
 func TestConsecutiveWrites_NoStaleReads(t *testing.T) {
-	crystal, err := storage.NewCausalCrystal("test_cons_write.log")
+	crystal, err := storage.NewCausalCrystal(filepath.Join(t.TempDir(), "test_cons_write.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer crystal.Close()
 
 	values := []string{"v0", "v1", "v2", "v3", "v4", "v5"}
 

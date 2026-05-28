@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +13,8 @@ import (
 )
 
 func TestEndToEnd(t *testing.T) {
-	crystal, _ := storage.NewCausalCrystal("test_crystal.log")
+	crystal, _ := storage.NewCausalCrystal(filepath.Join(t.TempDir(), "e2e_crystal.log"))
+	defer crystal.Close()
 	server := resp3.NewServer(crystal)
 
 	go server.ListenAndServe(":6380")

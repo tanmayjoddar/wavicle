@@ -2,6 +2,7 @@ package benchmarks
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"wavicle/internal/core"
 	"wavicle/internal/engine"
@@ -9,7 +10,11 @@ import (
 )
 
 func BenchmarkConcurrency_1000Clients(b *testing.B) {
-	crystal, _ := storage.NewCausalCrystal("bench_load.log")
+	crystal, err := storage.NewCausalCrystal(filepath.Join(b.TempDir(), "bench_load.log"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { crystal.Close() })
 
 	for i := 0; i < 100; i++ {
 		crystal.AppendAtom(&core.EConst{Value: core.VString("val")}, fmt.Sprintf("key_%d", i), nil)
@@ -40,7 +45,11 @@ func BenchmarkConcurrency_1000Clients(b *testing.B) {
 }
 
 func BenchmarkWarmRead_Wavicle_vs_RedisSim(b *testing.B) {
-	crystal, _ := storage.NewCausalCrystal("bench_warm.log")
+	crystal, err := storage.NewCausalCrystal(filepath.Join(b.TempDir(), "bench_warm.log"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { crystal.Close() })
 	key := "warm_key"
 	h, _ := crystal.AppendAtom(&core.EConst{Value: core.VString("warm_val")}, key, nil)
 	atom, _ := crystal.GetCurrent(key)

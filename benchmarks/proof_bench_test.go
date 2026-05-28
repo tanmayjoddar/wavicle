@@ -2,6 +2,7 @@ package benchmarks
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"wavicle/internal/core"
 	"wavicle/internal/engine"
@@ -9,10 +10,11 @@ import (
 )
 
 func setup50FieldCrystal(b *testing.B) (*storage.CausalCrystal, *core.ECompose, map[string]core.Hash, []core.Hash) {
-	crystal, err := storage.NewCausalCrystal("bench_crystal.log")
+	crystal, err := storage.NewCausalCrystal(filepath.Join(b.TempDir(), "bench_crystal.log"))
 	if err != nil {
 		b.Fatal(err)
 	}
+	b.Cleanup(func() { crystal.Close() })
 	var atoms []core.Hash
 	entries := make(map[string]core.Hash)
 	for i := 0; i < 50; i++ {
@@ -103,10 +105,11 @@ func BenchmarkProofReduction_WarmReuse_FastPath1(b *testing.B) {
 }
 
 func BenchmarkProofReduction_FastPath2_MerkleMatch(b *testing.B) {
-	crystal, err := storage.NewCausalCrystal("bench_merkle.log")
+	crystal, err := storage.NewCausalCrystal(filepath.Join(b.TempDir(), "bench_merkle.log"))
 	if err != nil {
 		b.Fatal(err)
 	}
+	b.Cleanup(func() { crystal.Close() })
 
 	var atoms []core.Hash
 	var paths []string
