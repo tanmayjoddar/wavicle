@@ -8,9 +8,15 @@ import (
 	"sync/atomic"
 	"time"
 	"wavicle/internal/core"
+	"wavicle/internal/semantic"
 )
 
 // CausalCrystal is Wavicle's storage engine.
+//
+// LOCK ORDER GLOBAL: proof.mu -> crystal.mu -> frontier.mu / parentIndex.mu
+// crystal.mu is the top-level lock protecting Merkle tree access.
+// Sub-structures (FrontierIndex, ParentIndex) have their own locks.
+// NEVER acquire proof.mu while holding crystal.mu.
 type CausalCrystal struct {
 	// Persistent storage
 	wal *WAL
@@ -213,8 +219,7 @@ func (c *CausalCrystal) Close() error {
 // Helpers
 
 func embedExpression(expr core.CombinatorExpr) core.Vector {
-	// Mock implementation
-	return core.Vector{}
+	return semantic.EmbedString(string(expr.Serialize()))
 }
 
 func inferDomain(path string) core.Domain {
