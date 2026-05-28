@@ -31,13 +31,25 @@ type ReduceStats struct {
 // Wavicle on stale: find changed fields -> recompute only those -> 0.1ms
 func ReduceIncremental(
 	proof *MaterializedProof,
-	crystal *storage.CausalCrystal,
+	store storage.Store,
 ) (core.Value, error) {
 	proof.mu.Lock()
 	defer proof.mu.Unlock()
 
 	proof.ReduceStats = ReduceStats{}
 	start := time.Now()
+
+	// In Phase 1, we assume the local storage is a CausalCrystal for these optimizations
+	crystal, isCrystal := store.(*storage.CausalCrystal)
+	if !isCrystal {
+		// Fallback for non-crystal stores: full re-reduce
+		newValue, err := reduceTree(proof.ProofTree, store, proof.NodeCache, proof)
+		if err != nil {
+			return nil, err
+		}
+		proof.Value = newValue
+		return newValue, nil
+	}
 
 	// FAST PATH 1: Version vector exact match — O(m)
 	if crystal.VerifyVersionVector(proof.VersionVector.Entries) {
@@ -82,7 +94,7 @@ func ReduceIncremental(
 
 func reduceTree(
 	expr core.CombinatorExpr,
-	crystal *storage.CausalCrystal,
+	crystal storage.Store,
 	nodeCache map[core.Hash]core.Value,
 	proof *MaterializedProof,
 ) (core.Value, error) {
@@ -115,7 +127,7 @@ func reduceTree(
 	case *core.ECompose:
 		record := make(core.VRecord, len(e.Atoms))
 		for _, origHash := range e.Atoms {
-			origAtom, ok := crystal.GetAtomByHash(origHash)
+			origAtom, ok := crystal.GetAtom(origHash)
 			if !ok {
 				return nil, fmt.Errorf("atom not found: %x", origHash)
 			}
