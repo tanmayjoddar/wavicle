@@ -136,11 +136,11 @@ Measured on a 12th Gen Intel Core i5-1240P laptop, Windows, Go 1.25. Workload: 5
 
 | Benchmark | Result | vs Full Rereduce | Cache Hits |
 |-----------|--------|-----------------|------------|
-| Cold proof (50 fields, from scratch) | 72,859 ns | 1.0x baseline | 0/50 |
-| **Incremental (1/50 changed)** | **1,516 ns** | **48x faster** | **49/50** |
-| Warm reuse FastPath1 (no changes) | 1,560 ns | 47x faster | — |
-| FastPath2 Merkle match (O(1)) | 351 ns | 207x faster | — |
-| FastPath1 version vector match | 83 ns | 877x faster | — |
+| Cold proof (50 fields, from scratch) | 124,027 ns | 1.0x baseline | 0/50 |
+| **Incremental (1/50 changed)** | **2,854 ns** | **43x faster** | **49/50** |
+| Warm reuse FastPath1 (no changes) | 2,506 ns | 49x faster | — |
+| FastPath2 Merkle match (O(1)) | 775 ns | 160x faster | — |
+| FastPath1 version vector match | 145 ns | 855x faster | — |
 | Atom append with fsync | 812,388 ns | ~1,200 ops/sec | — |
 
 The 48x speedup comes from the node cache: 49 of 50 unchanged atoms are served in O(1). Only the changed field's expression misses and is re-reduced.
@@ -183,7 +183,7 @@ Three tests prove zero stale reads under mutation. All pass.
 | **2 — Production Ready** | Ship to design partners | Hash data type, TTL, MGET/MSET, Prometheus metrics, auth, 7-day soak test | **H1 2027** |
 | **3 — Enterprise** | Scale and sell | Multi-DB support, RBAC, SSO, audit, cloud marketplace | **H2 2027** |
 
-**The Causal Crystal** (standalone storage engine) was Phase 0 infrastructure used to validate the algorithm. In production deployment, Wavicle attaches to your existing PostgreSQL/MySQL database. The Causal Crystal remains available for development, testing, and embedded use cases.
+**The Causal Crystal** (standalone storage engine) was Phase 0 infrastructure used to validate the algorithm. In production deployment, Wavicle attaches to your existing database. The Causal Crystal remains available for development, testing, and embedded use cases.
 
 ---
 
@@ -199,10 +199,10 @@ Three tests prove zero stale reads under mutation. All pass.
 | Scenario | Why | What's Needed |
 |----------|-----|---------------|
 | Production deployment | No Docker, config, auth, metrics | Phase 2 |
-| Write-heavy workloads | Fsync bottleneck at ~1,200/sec | PostgreSQL integration (writes go to PG) |
+| Write-heavy workloads | Fsync bottleneck at ~1,200/sec in dev mode | Production mode (writes go to your database) |
 | Complex queries | Only 6 commands, no SQL parser | Phase 1 |
 | Multi-node | Single-threaded, no sharding | Phase 3 |
-| MySQL integration | PostgreSQL only planned first | Phase 3 |
+| Additional DB adapters | PostgreSQL first, MySQL and others later | Phase 3 |
 
 ---
 
@@ -230,8 +230,8 @@ wavicle/
 ├── benchmarks/
 │   ├── proof_bench_test.go              # 5 reduction benchmarks
 │   └── load_test.go                     # Concurrency benchmarks
-├── PRODUCTION_ROADMAP.md                # Go-to-market plan
-└── blueprint.md                         # Full architectural spec
+├── blueprint.md                         # Full architectural spec
+└── WAVICLE_GRAPH.md                     # LLM system graph (local only)
 ```
 
 ---
