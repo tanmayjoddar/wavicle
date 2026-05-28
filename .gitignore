@@ -3,5 +3,8 @@
 bench_test.exe
 .DS_Store
 Thumbs.db
+data/
 ll.md
 prmpt.md
+PRODUCTION_ROADMAP.md
+WAVICLE_GRAPH.md
