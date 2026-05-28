@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -16,16 +18,16 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Listen        string `yaml:"listen"`
-	MaxConns      int    `yaml:"max_connections"`
-	ReadTimeout   time.Duration `yaml:"read_timeout"`
-	WriteTimeout  time.Duration `yaml:"write_timeout"`
+	Listen       string        `yaml:"listen"`
+	MaxConns     int           `yaml:"max_connections"`
+	ReadTimeout  time.Duration `yaml:"read_timeout"`
+	WriteTimeout time.Duration `yaml:"write_timeout"`
 }
 
 type StorageConfig struct {
-	DataDir        string `yaml:"data_dir"`
-	Engine         string `yaml:"engine"` // "crystal" or "postgres" or "mysql"
-	MaxFrontier    int    `yaml:"max_frontier"`
+	DataDir     string `yaml:"data_dir"`
+	Engine      string `yaml:"engine"` // "crystal" or "postgres" or "mysql"
+	MaxFrontier int    `yaml:"max_frontier"`
 }
 
 type EngineConfig struct {
@@ -39,11 +41,11 @@ type ProofCacheConfig struct {
 }
 
 type DBConfig struct {
-	Type             string          `yaml:"type"`
-	DSN              string          `yaml:"dsn"`
-	ReplicationSlot  string          `yaml:"replication_slot"`
-	Publication      string          `yaml:"publication"`
-	TableMappings    []TableMapping  `yaml:"table_mappings"`
+	Type            string         `yaml:"type"`
+	DSN             string         `yaml:"dsn"`
+	ReplicationSlot string         `yaml:"replication_slot"`
+	Publication     string         `yaml:"publication"`
+	TableMappings   []TableMapping `yaml:"table_mappings"`
 }
 
 type TableMapping struct {
@@ -63,7 +65,7 @@ type LoggingConfig struct {
 }
 
 func Default() *Config {
-	return &Config{
+	c := &Config{
 		Server: ServerConfig{
 			Listen:       ":6379",
 			MaxConns:     10000,
@@ -85,7 +87,7 @@ func Default() *Config {
 		DB: DBConfig{
 			Type:            "crystal",
 			DSN:             "",
-			ReplicationSlot: "wavicle_proof_cache",
+			ReplicationSlot: "wavicle_slot",
 			Publication:     "wavicle_proofs",
 		},
 		Metrics: MetricsConfig{
@@ -96,6 +98,48 @@ func Default() *Config {
 			Level:  "info",
 			Format: "text",
 		},
+	}
+	c.LoadFromEnv()
+	return c
+}
+
+func (c *Config) LoadFromEnv() {
+	if v := os.Getenv("WAVICLE_SERVER_LISTEN"); v != "" {
+		c.Server.Listen = v
+	}
+	if v := os.Getenv("WAVICLE_STORAGE_ENGINE"); v != "" {
+		c.Storage.Engine = v
+	}
+	if v := os.Getenv("WAVICLE_STORAGE_DATA_DIR"); v != "" {
+		c.Storage.DataDir = v
+	}
+	if v := os.Getenv("WAVICLE_DB_TYPE"); v != "" {
+		c.DB.Type = v
+	}
+	if v := os.Getenv("WAVICLE_DB_DSN"); v != "" {
+		c.DB.DSN = v
+	}
+	if v := os.Getenv("WAVICLE_DB_REPLICATION_SLOT"); v != "" {
+		c.DB.ReplicationSlot = v
+	}
+	if v := os.Getenv("WAVICLE_DB_PUBLICATION"); v != "" {
+		c.DB.Publication = v
+	}
+	if v := os.Getenv("WAVICLE_METRICS_ENABLED"); v != "" {
+		c.Metrics.Enabled = (v == "true")
+	}
+	if v := os.Getenv("WAVICLE_METRICS_LISTEN"); v != "" {
+		c.Metrics.Listen = v
+	}
+	if v := os.Getenv("WAVICLE_LOG_LEVEL"); v != "" {
+		c.Logging.Level = v
+	}
+
+	// Internal limits
+	if v := os.Getenv("WAVICLE_CACHE_ENTRIES"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.Engine.ProofCache.MaxEntries = i
+		}
 	}
 }
 
