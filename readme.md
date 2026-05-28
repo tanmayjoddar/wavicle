@@ -12,32 +12,69 @@
 
 # ⚛ Wavicle — The Causal Proof Engine
 
-> **A new kind of database.** Not a wrapper. Not a proxy. A storage engine that eliminates cache invalidation by replacing stale-value detection with proof-based staleness detection.
+> **Every cached value keeps a receipt of what it depends on. When data changes, the receipt shows exactly which cached values are stale — and only the affected parts get recomputed.**
 
-```
-Traditional:          store EFFECTS + manual TTL/pub-sub invalidation
-Wavicle:              store CAUSES  + automatic hash-comparison staleness
-
-Result:               zero stale reads, zero invalidation code, 48x incremental reads
-```
+Not a wrapper. Not a proxy. A standalone database with its own storage engine, its own cache, and its own computation model. The RESP3 protocol is just how clients talk to it.
 
 ---
 
-## Why Wavicle Exists
+## The Idea
 
-Every modern backend has a version of this problem:
+Most databases store *values* and manage changes with expirations, invalidations, or pub/sub events. Engineer writes code to keep things in sync. Some lines get forgotten. Data goes stale.
+
+Wavicle takes a different approach. It stores *generative programs* — small expressions that describe how a value was computed. When a write happens, a new atom is appended to an append-only log. Nothing is deleted, nothing is overwritten.
+
+When a cached read happens, the cache doesn't trust its own data. It checks a *version vector* — a list of "I depended on these atom versions" — against the current state. If nothing changed, the cached value is returned instantly. If something changed, only the affected sub-expressions are recomputed.
+
+This isn't a radical idea. It's just applying content-addressed caching to the database world. The math has been understood for decades. What's new is building it as a practical storage engine and measuring whether it actually works.
+
+**It does.** 48x faster incremental reads. Zero stale reads proven by test. ~1,200 fsync writes per second. These are real numbers from a real codebase running on a laptop.
+
+---
+
+## Quick Start
+
+```bash
+# Build the server and CLI
+go build -o wavicle .
+go build -o wavicle-cli ./cmd/wavicle-cli/
+
+# Start Wavicle (RESP3 wire protocol on :6379)
+./wavicle
+
+# In another terminal — all 6 commands, running against Wavicle:
+```
 
 ```
-PostgreSQL   → source of truth     (slow, 2–10ms)
-Redis        → cache               (fast, goes stale, manual invalidation)
-Some sync    → keeps them in sync  (another system to maintain)
+$ ./wavicle-cli PING
+PONG
+
+$ ./wavicle-cli SET user:123:name "Alice"
+OK
+
+$ ./wavicle-cli GET user:123:name
+Alice
+
+$ ./wavicle-cli EXISTS user:123:name
+(integer) 1
+
+$ ./wavicle-cli DBSIZE
+(integer) 1
+
+$ ./wavicle-cli DEL user:123:name
+(integer) 1
+
+# After deletion, the key returns nil and no longer exists:
+$ ./wavicle-cli EXISTS user:123:name
+(integer) 0
+
+$ ./wavicle-cli GET user:123:name
+(nil)
+
+# Missing keys also return nil:
+$ ./wavicle-cli GET nonexistent
+(nil)
 ```
-
-**The root cause:** two systems storing the same data cannot be atomically consistent. Engineers write manual invalidation code — and forget lines. Result: stale data, 3am incidents, customer-facing bugs.
-
-**Wavicle's thesis:** store *generative programs* (proofs), not *static values*. When data changes, append a new atom. Every cached proof detects staleness at read time via hash comparison — and recomputes only the changed sub-expressions.
-
-**No TTL. No pub/sub. No invalidation code. Zero stale reads.**
 
 ---
 
@@ -46,37 +83,38 @@ Some sync    → keeps them in sync  (another system to maintain)
 ```mermaid
 graph TB
     subgraph "Client Layer"
-        RC["wavicle-cli / any RESP3 client"]
+        CLI["wavicle-cli"]
+        ANY["any RESP3 client"]
     end
 
-    subgraph "Protocol Tier — RESP3 Server"
+    subgraph "Protocol — RESP3 Server"
         TCP["TCP :6379"]
-        PARSE["Inline + RESP Array Parser"]
-        CMDS["SET / GET / DEL / EXISTS / DBSIZE / PING"]
+        PARSE["RESP3 Parser"]
+        CMDS["6 commands"]
     end
 
-    subgraph "Computation Tier — Proof Engine"
-        CACHE["Proof Cache (Sharded LRU)"]
-        COLD["Cold Composer (causal closure)"]
-        INCR["Incremental Reducer (3 fast paths)"]
+    subgraph "Computation — Proof Engine"
+        CACHE["Proof Cache<br/>sharded LRU"]
+        COLD["Proof Composer<br/>causal closure walk"]
+        INCR["Incremental Reducer<br/>3 fast paths"]
     end
 
-    subgraph "Storage Tier — Causal Crystal"
+    subgraph "Storage — Causal Crystal"
         CRYSTAL["CausalCrystal"]
-        WAL["WAL (JSON lines + fsync)"]
-        FRONT["Frontier Index (path -> hash, O(1))"]
-        PARENT["Parent Index (hash -> parents, O(1))"]
-        MERKLE["Merkle Tree (SHA3-256)"]
-        ATOMCACHE["Atom Cache (sync.Map)"]
+        WAL["WAL<br/>JSON lines + fsync"]
+        FRONT["Frontier Index<br/>path → hash, O(1)"]
+        PARENT["Parent Index<br/>hash → parents, O(1)"]
+        MERKLE["Merkle Tree<br/>SHA3-256 binary tree"]
+        ATOMCACHE["Atom Cache<br/>sync.Map"]
     end
 
-    RC --> TCP --> PARSE --> CMDS
-    CMDS --> GET
-    CMDS --> SET
-    GET --> CACHE
-    CACHE -->|miss| COLD --> CRYSTAL
+    CLI --> TCP
+    ANY --> TCP
+    TCP --> PARSE --> CMDS
+    CMDS -->|GET| CACHE
     CACHE -->|hit| INCR --> CRYSTAL
-    SET --> CRYSTAL
+    CACHE -->|miss| COLD --> CRYSTAL
+    CMDS -->|SET/DEL| CRYSTAL
     CRYSTAL --> WAL
     CRYSTAL --> FRONT
     CRYSTAL --> PARENT
@@ -84,127 +122,84 @@ graph TB
     CRYSTAL --> ATOMCACHE
 ```
 
----
-
-## The Incremental Reduction Algorithm
-
-Every read goes through up to three fast paths. Only the changed sub-expressions are recomputed.
+### How a Read Works
 
 ```
-ReduceIncremental(proof, crystal):
-
-  1. FAST PATH 1 — Version Vector Match (O(m))
-     Compare each {path, hash} against the Active Frontier.
-     ALL match → return cached value.              → 83 ns
-
-  2. FAST PATH 2 — Merkle Root Match (O(1))
-     Single hash comparison of dependency Merkle root.
-     Matches → return cached value.                → 351 ns
-
-  3. INCREMENTAL PATH (k changes detected)
-     a. FindChangedPaths() — compare VV vs frontier
-     b. For each atom reference in the tree:
-        - Resolve via Active Frontier (not stale reference)
-        - Hash unchanged → node cache HIT (O(1))
-        - Hash changed → re-reduce (cache MISS)
-     c. Update VersionVector + MerkleRoot          → 1,516 ns
-```
-
-**When 1 of 50 fields changes:**
-- Redis: delete cached key → next request hits DB → **~5ms cold query**
-- Wavicle: detect exactly 1 stale path → re-reduce only that subtree → **1.5μs (49/50 cache hits)**
-
----
-
-## Quick Start
-
-```bash
-# Build
-go build -o wavicle .
-go build -o wavicle-cli ./cmd/wavicle-cli/
-
-# Start the Wavicle server (RESP3 wire protocol on :6379)
-./wavicle
-
-# In another terminal — use the Wavicle CLI:
-./wavicle-cli SET user:123:name "Alice"
-# OK
-
-./wavicle-cli GET user:123:name
-# "Alice"
-
-./wavicle-cli EXISTS user:123:name
-# (integer) 1
-```
-
-### Run Tests
-
-```bash
-# Correctness tests (PoisonWrite, ReadAfterWrite, ConsecutiveWrites)
-go test -v ./internal/engine/
-
-# Benchmarks (incremental reduction, fast paths, concurrency)
-go test -run '^$' -bench . -benchtime=200ms ./benchmarks/
-
-# Full test suite
-go test ./...
+GET user:123:name
+           │
+           ▼
+     ┌─ Fast Path 1 ──────────────────────┐
+     │  Version Vector Match              │  83 ns
+     │  "did any dependency change?"      │
+     │  all match → return cached value   │
+     └────────────────────────────────────┘
+           │ stale
+           ▼
+     ┌─ Fast Path 2 ──────────────────────┐
+     │  Merkle Root Match                 │  351 ns
+     │  single hash comparison            │
+     │  matches → return cached value     │
+     └────────────────────────────────────┘
+           │ changed
+           ▼
+     ┌─ Incremental Path ─────────────────┐
+     │  Find which paths changed          │  1,516 ns
+     │  For each atom in the tree:        │  (1 changed out of 50)
+     │    unchanged → node cache HIT      │  49/50 cache hits
+     │    changed → re-reduce             │
+     │  Update version vector             │
+     └────────────────────────────────────┘
+           │
+           ▼
+        return "Alice"
 ```
 
 ---
 
 ## Performance
 
-All benchmarks measured on 12th Gen Intel Core i5-1240P, Windows, Go 1.25. Workload: 50-field composite record, single-field mutation.
+Measured on a 12th Gen Intel Core i5-1240P laptop, Windows, Go 1.25. Workload: 50-field composite record with 1 field mutated.
 
-### Read Latency
+| Benchmark | Result | vs Full Rereduce | Cache Hits |
+|-----------|--------|-----------------|------------|
+| Cold proof (50 fields, from scratch) | 72,859 ns | 1.0x baseline | 0/50 |
+| **Incremental (1/50 changed)** | **1,516 ns** | **48x faster** | **49/50** |
+| Warm reuse FastPath1 (no changes) | 1,560 ns | 47x faster | — |
+| FastPath2 Merkle match (O(1)) | 351 ns | 207x faster | — |
+| FastPath1 version vector match | 83 ns | 877x faster | — |
+| Concurrent (1000 clients, 90/10 r/w) | 50,308 ns | — | — |
+| Atom append with fsync | 812,388 ns | ~1,200 ops/sec | — |
 
-| Benchmark | Result | vs Cold | Cache Hits |
-|-----------|--------|---------|------------|
-| Cold ProofReduction (50 fields, first ever) | 72,859 ns | 1.0x baseline | 0/50 |
-| **Incremental Warm (1/50 changed)** | **1,516 ns** | **48x faster** | **49/50** |
-| WarmReuse FastPath1 (hot cache) | 1,560 ns | 47x faster | — |
-| FastPath2 MerkleMatch (O(1) hash comparison) | 351 ns | 207x faster | — |
-| Wavicle WarmRead (FastPath1, nothing changed) | 83 ns | 877x faster | — |
+The 48x speedup comes from the node cache: 49 of 50 unchanged atoms are served in O(1). Only the changed field's expression misses and is reduced. This is not a simulation — these are real benchmark results from the code in this repository.
 
-### Write Throughput
+---
 
-| Operation | Latency | Throughput |
-|-----------|---------|------------|
-| Atom append (with fsync) | 812 μs | ~1,200 ops/sec |
-| Atom append (warm, cached) | ~0.08 μs | — |
+## Commands
 
-### Concurrency
+All 6 commands work against Wavicle's own storage engine. Every SET appends an immutable atom to the Causal Crystal. Every GET checks the proof cache first, then falls back to composing a proof from the Crystal. DEL appends a tombstone atom — the history is preserved.
 
-| Scenario | Latency | Notes |
-|----------|---------|-------|
-| 1000 clients, 90/10 read/write | 50 μs | Single-threaded, no sharding |
+| Command | Example | Response | Notes |
+|---------|---------|----------|-------|
+| `PING` | `PING` | `PONG` | Server health check |
+| `SET` | `SET key value` | `OK` | Appends atom to Crystal |
+| `GET` | `GET key` | value or `(nil)` | Proof cache → incremental reduce → cold compose |
+| `EXISTS` | `EXISTS key` | `(integer) N` | Count of live (non-tombstoned) keys |
+| `DEL` | `DEL key` | `(integer) N` | Appends tombstone atom |
+| `DBSIZE` | `DBSIZE` | `(integer) N` | Count of live frontier entries |
+
+Wire protocol is **RESP3** — the same protocol Redis speaks. Wavicle includes its own `wavicle-cli` tool, but any RESP3-compatible client can connect.
 
 ---
 
 ## Correctness
 
-All three correctness tests pass — proving **zero stale reads under mutation**:
+Three tests prove zero stale reads under mutation. All pass.
 
-| Test | Scenario | What It Proves |
-|------|----------|----------------|
-| **PoisonWrite** | 50-field proof → mutate 1 field → incremental read | Returns new value (not stale) + 49/50 cache hits |
-| **ReadAfterWrite** | SET Alice → proof → SET Bob → read | Returns Bob, not Alice |
-| **ConsecutiveWrites** | 6 writes to same key, immediate reads | Each write visible immediately |
+**PoisonWrite:** Build a 50-field composite proof. Mutate 1 field. Read incrementally. The result contains the new value for the changed field, the original values for the other 49, and 49 of 50 cache hits. Zero stale reads.
 
----
+**ReadAfterWrite:** SET "Alice" → read (returns "Alice") → SET "Bob" → read (returns "Bob"). Every write is immediately visible. Zero stale reads.
 
-## API Reference
-
-| Command | Status | Implementation |
-|---------|--------|----------------|
-| `PING` | ✅ | Health check |
-| `SET key value` | ✅ | Appends atom to Causal Crystal |
-| `GET key` | ✅ | Proof cache → incremental reduce → cold compose |
-| `DEL key [keys...]` | ✅ | Appends VNull tombstone atom |
-| `EXISTS key [keys...]` | ✅ | Frontier lookup |
-| `DBSIZE` | ✅ | Frontier entry count |
-
-Wire protocol: **RESP3** (inline commands + RESP arrays). Wavicle includes its own `wavicle-cli` tool. Also works with any RESP3-compatible client (`go-redis`, `ioredis`, etc.).
+**ConsecutiveWrites:** 6 writes to the same key, each followed by an immediate read. Every write visible. No stale reads.
 
 ---
 
@@ -212,36 +207,56 @@ Wire protocol: **RESP3** (inline commands + RESP arrays). Wavicle includes its o
 
 ```
 wavicle/
-├── main.go                              # Server entry point
-├── cmd/wavicle-cli/main.go              # CLI client entry point
+├── main.go                          # Server entry point
+├── cmd/wavicle-cli/main.go          # CLI tool
 ├── internal/
-│   ├── core/types.go                    # Hash, Value, CombinatorExpr, CausalAtom
+│   ├── core/types.go                # Core types: Hash, Value, CausalAtom
 │   ├── storage/
-│   │   ├── crystal.go                   # CausalCrystal — the storage engine
-│   │   ├── wal.go                       # Write-ahead log with fsync
-│   │   ├── frontier.go                  # Active Frontier Index
-│   │   ├── parent_index.go              # Parent Index
-│   │   └── merkle.go                    # Binary Merkle Tree
+│   │   ├── crystal.go               # CausalCrystal — the storage engine
+│   │   ├── wal.go                   # Write-ahead log, fsync, crash recovery
+│   │   ├── frontier.go              # Active Frontier Index (path → hash)
+│   │   ├── parent_index.go          # Parent Index (hash → parents)
+│   │   └── merkle.go                # Binary Merkle Tree (SHA3-256)
 │   ├── engine/
-│   │   ├── proof.go                     # MaterializedProof + VersionVector
-│   │   ├── compose.go                   # Cold proof composition
-│   │   ├── incremental.go               # Incremental reduction (CORE)
-│   │   ├── version_vector.go            # Merkle root computation
-│   │   ├── cache.go                     # Sharded LRU proof cache
-│   │   └── engine_test.go               # 3 correctness tests
-│   ├── protocol/resp3/server.go         # TCP RESP3 server
-│   ├── fidelity/policy.go               # Glob-pattern enforcement
+│   │   ├── proof.go                 # MaterializedProof + VersionVector
+│   │   ├── compose.go               # Cold proof composition
+│   │   ├── incremental.go           # Incremental reduction (core algorithm)
+│   │   ├── version_vector.go        # Merkle root computation
+│   │   ├── cache.go                 # Sharded LRU proof cache
+│   │   └── engine_test.go           # Correctness tests
+│   ├── protocol/resp3/server.go     # TCP RESP3 server + command handlers
+│   ├── fidelity/policy.go           # Glob-path consistency enforcement
 │   ├── autopoiesis/
-│   │   ├── diffraction.go               # Merkle decomposition
-│   │   └── entanglement.go              # Lift + chi-squared
-│   └── semantic/hrr.go                  # HRR vector operations
+│   │   ├── diffraction.go           # Merkle tree value decomposition
+│   │   └── entanglement.go          # Lift + chi-squared statistics
+│   └── semantic/hrr.go              # HRR vector ops, string embeddings
 ├── benchmarks/
-│   ├── proof_bench_test.go              # 5 reduction benchmarks
-│   └── load_test.go                     # Concurrency benchmarks
-├── PRODUCTION_ROADMAP.md                # 3-phase go-to-market plan
-├── blueprint.md                         # Full architectural spec
-└── WAVICLE_GRAPH.md                     # Complete system graph for LLMs
+│   ├── proof_bench_test.go          # Reduction benchmarks
+│   └── load_test.go                 # Concurrency benchmarks
+├── PRODUCTION_ROADMAP.md            # Full go-to-market plan
+├── blueprint.md                     # Architectural specification
+└── WAVICLE_GRAPH.md                 # Complete system graph
 ```
+
+---
+
+## When to Use Wavicle
+
+Wavicle is a prototype that proves a thesis. It works well for:
+
+- **Read-heavy workloads** with structured composite values (like user profiles with many fields)
+- **Session storage** where TTL-based invalidation is error-prone
+- Any scenario where **zero stale reads** matters more than raw write throughput
+
+It is not yet suitable for:
+
+| Scenario | Why | What's Needed |
+|----------|-----|---------------|
+| >100M keys | All indexes in RAM | Disk-based index (LSM/B-tree) |
+| Write-heavy (>50%) | Fsync bottleneck at ~1,200/sec | Batch writes or async fsync |
+| Complex query patterns | Only 6 commands implemented | Phase 1+ on roadmap |
+| Multi-key transactions | Single-key atomicity only | Cross-path atomic commit |
+| Production deployment | No Docker, config, metrics yet | Phase 1 on roadmap |
 
 ---
 
@@ -250,44 +265,31 @@ wavicle/
 | Operation | Time | Space |
 |-----------|------|-------|
 | Atom append (fsync) | O(1) amortized | O(1) |
-| Active frontier read | O(1) | O(1) |
-| Proof reduction (warm, FP1) | O(m) | O(1) |
-| Proof reduction (warm, FP2) | O(1) | O(1) |
+| Frontier read (hot) | O(1) | O(1) |
+| Proof reduction (FP1, nothing changed) | O(m) | O(1) |
+| Proof reduction (FP2, Merkle match) | O(1) | O(1) |
 | Proof reduction (incremental, k changes) | O(k) | O(k) |
 | Proof composition (cold) | O(n) | O(n) |
 | Merkle root computation | O(n log n) | O(n) |
 
 ---
 
-## Known Limitations
-
-| Scenario | Why It Fails | Status |
-|----------|-------------|--------|
-| >100M atoms | RAM exhaustion. All indexes in memory. | Needs disk-based index |
-| Write-heavy (>50% writes) | Fsync bottleneck ~1,200 ops/sec | Batch writes or async fsync |
-| Complex Redis commands | Only 6/300+ commands | Phase 1 roadmap |
-| Multi-key transactions | Single-key atomicity only | Not yet designed |
-| Crash during WAL read | JSON partial last line silently discarded | Binary encoding with checksums |
-| Process restart | Full WAL replay (~1s for 1M atoms) | Segment compaction planned |
-
----
-
 ## Roadmap
 
-| Phase | Goal | Status |
-|-------|------|--------|
-| **Phase 0** — Validation | 6 commands, benchmarks, correctness tests, thesis proven | ✅ **Complete** |
-| **Phase 1** — Proxy Product | 15+ commands, hash type, TTL, Docker, telemetry, 1 design partner | 🔄 **In progress** |
-| **Phase 2** — Native Mode | Time-travel, backup/restore, Redis decommissioned | 📋 Planned |
-| **Phase 3** — Distributed | Multi-node, Merkle consensus, cloud marketplace | 📋 Planned |
+| Phase | Focus | Status |
+|-------|-------|--------|
+| **0 — Validation** | Core engine, 6 commands, benchmarks, correctness | ✅ Complete |
+| **1 — Product** | Hash types, TTL, MGET/MSET, Docker, telemetry | 🔄 Next |
+| **2 — Native** | Time-travel queries, backup/restore, full RESP3 | 📋 |
+| **3 — Distributed** | Multi-node, Merkle consensus, cloud | 📋 |
 
-See [PRODUCTION_ROADMAP.md](./PRODUCTION_ROADMAP.md) for the full plan.
+See [PRODUCTION_ROADMAP.md](./PRODUCTION_ROADMAP.md).
 
 ---
 
 ## Built With
 
-- **Go 1.25+** — single compiled binary, zero runtime dependencies
+- **Go 1.25+** — single binary, zero runtime dependencies
 - **golang.org/x/crypto** — SHA3-256 for content-addressed hashing
 - **Standard library** — net, sync, atomic, crypto/rand
 
@@ -300,5 +302,5 @@ MIT
 ---
 
 <p align="center">
-  <sub><strong>Build the first atom. Measure everything. Let reality decide.</strong></sub>
+  <sub>Build the first atom. Measure everything. Let reality decide.</sub>
 </p>
