@@ -164,15 +164,23 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		var queryHash core.Hash
 		copy(queryHash[:], h.Sum(nil))
 
-		if _, ok := s.crystal.GetCurrent(path); !ok {
+		current, ok := s.crystal.GetCurrent(path)
+		if !ok {
 			return "$-1\r\n", nil
+		}
+		// Return nil for tombstoned keys
+		if current.Expr != nil {
+			if e, ok := current.Expr.(*core.EConst); ok {
+				if _, isNull := e.Value.(core.VNull); isNull {
+					return "$-1\r\n", nil
+				}
+			}
 		}
 
 		if proof, ok := s.proofCache.Get(queryHash); ok {
 			val, err := engine.ReduceIncremental(proof, s.crystal)
 			if err == nil {
-				str := fmt.Sprintf("%v", val)
-				return fmt.Sprintf("$%d\r\n%s\r\n", len(str), str), nil
+				return formatValue(val), nil
 			}
 		}
 
@@ -182,8 +190,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		}
 		s.proofCache.Set(queryHash, proof)
 
-		str := fmt.Sprintf("%v", proof.Value)
-		return fmt.Sprintf("$%d\r\n%s\r\n", len(str), str), nil
+		return formatValue(proof.Value), nil
 
 	case "DEL":
 		if len(args) < 2 {
@@ -207,16 +214,50 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		}
 		count := 0
 		for _, path := range args[1:] {
-			if _, ok := s.crystal.GetCurrent(path); ok {
-				count++
+			if atom, ok := s.crystal.GetCurrent(path); ok {
+				if !isTombstone(atom) {
+					count++
+				}
 			}
 		}
 		return fmt.Sprintf(":%d\r\n", count), nil
 
 	case "DBSIZE":
-		return fmt.Sprintf(":%d\r\n", len(s.crystal.FrontierPaths())), nil
+		count := 0
+		for _, path := range s.crystal.FrontierPaths() {
+			if atom, ok := s.crystal.GetCurrent(path); ok && !isTombstone(atom) {
+				count++
+			}
+		}
+		return fmt.Sprintf(":%d\r\n", count), nil
 
 	default:
 		return "", fmt.Errorf("unknown command '%s'", cmd)
 	}
+}
+
+// formatValue converts a Wavicle Value to a RESP3 bulk string.
+// If the value is a VRecord with a single entry, it extracts the inner value.
+func formatValue(v core.Value) string {
+	if rec, ok := v.(core.VRecord); ok && len(rec) == 1 {
+		for _, val := range rec {
+			return formatBulkString(fmt.Sprintf("%v", val))
+		}
+	}
+	return formatBulkString(fmt.Sprintf("%v", v))
+}
+
+func formatBulkString(s string) string {
+	return fmt.Sprintf("$%d\r\n%s\r\n", len(s), s)
+}
+
+func isTombstone(atom *core.CausalAtom) bool {
+	if atom == nil || atom.Expr == nil {
+		return false
+	}
+	if e, ok := atom.Expr.(*core.EConst); ok {
+		_, isNull := e.Value.(core.VNull)
+		return isNull
+	}
+	return false
 }
