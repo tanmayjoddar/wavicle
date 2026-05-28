@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  wavicle:
+    build: .
+    ports:
+      - "6379:6379"
+      - "8080:8080"
+    volumes:
+      - wavicle-data:/var/lib/wavicle
+    environment:
+      - WAVICLE_METRICS_ENABLED=true
+    restart: unless-stopped
+
+volumes:
+  wavicle-data:

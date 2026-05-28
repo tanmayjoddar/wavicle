@@ -1,0 +1,130 @@
+package config
+
+import (
+	"fmt"
+	"path/filepath"
+	"time"
+)
+
+type Config struct {
+	Server  ServerConfig  `yaml:"server"`
+	Storage StorageConfig `yaml:"storage"`
+	Engine  EngineConfig  `yaml:"engine"`
+	DB      DBConfig      `yaml:"db"`
+	Metrics MetricsConfig `yaml:"metrics"`
+	Logging LoggingConfig `yaml:"logging"`
+}
+
+type ServerConfig struct {
+	Listen        string `yaml:"listen"`
+	MaxConns      int    `yaml:"max_connections"`
+	ReadTimeout   time.Duration `yaml:"read_timeout"`
+	WriteTimeout  time.Duration `yaml:"write_timeout"`
+}
+
+type StorageConfig struct {
+	DataDir        string `yaml:"data_dir"`
+	Engine         string `yaml:"engine"` // "crystal" or "postgres" or "mysql"
+	MaxFrontier    int    `yaml:"max_frontier"`
+}
+
+type EngineConfig struct {
+	ProofCache ProofCacheConfig `yaml:"proof_cache"`
+}
+
+type ProofCacheConfig struct {
+	MaxEntries int   `yaml:"max_entries"`
+	MaxBytes   int64 `yaml:"max_bytes"`
+	Shards     int   `yaml:"shards"`
+}
+
+type DBConfig struct {
+	Type             string          `yaml:"type"`
+	DSN              string          `yaml:"dsn"`
+	ReplicationSlot  string          `yaml:"replication_slot"`
+	Publication      string          `yaml:"publication"`
+	TableMappings    []TableMapping  `yaml:"table_mappings"`
+}
+
+type TableMapping struct {
+	Table       string   `yaml:"table"`
+	KeyTemplate string   `yaml:"key_template"`
+	Columns     []string `yaml:"columns"`
+}
+
+type MetricsConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Listen  string `yaml:"listen"`
+}
+
+type LoggingConfig struct {
+	Level  string `yaml:"level"`
+	Format string `yaml:"format"` // "json" or "text"
+}
+
+func Default() *Config {
+	return &Config{
+		Server: ServerConfig{
+			Listen:       ":6379",
+			MaxConns:     10000,
+			ReadTimeout:  5 * time.Second,
+			WriteTimeout: 5 * time.Second,
+		},
+		Storage: StorageConfig{
+			DataDir:     "data",
+			Engine:      "crystal",
+			MaxFrontier: 10000000,
+		},
+		Engine: EngineConfig{
+			ProofCache: ProofCacheConfig{
+				MaxEntries: 100000,
+				MaxBytes:   200 * 1024 * 1024, // 200 MB
+				Shards:     64,
+			},
+		},
+		DB: DBConfig{
+			Type:            "crystal",
+			DSN:             "",
+			ReplicationSlot: "wavicle_proof_cache",
+			Publication:     "wavicle_proofs",
+		},
+		Metrics: MetricsConfig{
+			Enabled: false,
+			Listen:  ":8080",
+		},
+		Logging: LoggingConfig{
+			Level:  "info",
+			Format: "text",
+		},
+	}
+}
+
+func (c *Config) Validate() error {
+	if c.Server.Listen == "" {
+		return fmt.Errorf("server.listen is required")
+	}
+	if c.Server.MaxConns <= 0 {
+		return fmt.Errorf("server.max_connections must be positive")
+	}
+	if c.Storage.Engine != "crystal" && c.Storage.Engine != "postgres" && c.Storage.Engine != "mysql" {
+		return fmt.Errorf("storage.engine must be 'crystal', 'postgres', or 'mysql'")
+	}
+	if c.Storage.DataDir == "" {
+		return fmt.Errorf("storage.data_dir is required")
+	}
+	if c.Engine.ProofCache.MaxEntries <= 0 {
+		return fmt.Errorf("engine.proof_cache.max_entries must be positive")
+	}
+	if c.Engine.ProofCache.Shards <= 0 {
+		return fmt.Errorf("engine.proof_cache.shards must be positive")
+	}
+	return nil
+}
+
+func (c *Config) DataPath(name string) string {
+	return filepath.Join(c.Storage.DataDir, name)
+}
+
+func (c *Config) WALPath() string {
+	return c.DataPath("crystal.log")
+}

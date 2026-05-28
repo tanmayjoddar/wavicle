@@ -161,14 +161,22 @@ No TTL to tune. No pub/sub to wire up. No invalidate to forget.
 
 ```
 # Every SET creates a new atom. Old atoms stay — nothing is overwritten.
-# Staleness is detected at read time, not written away.
 wavicle-cli SET user:name "Alice"
 # OK
 
-wavicle-cli SET user:name "Bob"     # Same key, new atom. Previous atom still exists.
-# OK                                    # Cache auto-detects the change on next read.
+wavicle-cli SET user:name "Bob"     # Same key, new atom.
+# OK                                    # Cache auto-detects change on next read.
 
-wavicle-cli DEL user:name           # Appends tombstone atom. History preserved.
+wavicle-cli MSET user:email "a@t.com" user:age "30"  # Batch set
+# OK
+
+wavicle-cli HSET profile:1 theme dark          # Hash field set
+# (integer) 1
+
+wavicle-cli HSET profile:1 lang go
+# (integer) 1
+
+wavicle-cli DEL user:name                      # Tombstone atom. History preserved.
 # (integer) 1
 ```
 
@@ -176,12 +184,37 @@ wavicle-cli DEL user:name           # Appends tombstone atom. History preserved.
 
 ```
 # GET checks: "did any dependency change since I was cached?"
-# If no → return cached value (83ns). If yes → re-reduce only what changed.
 wavicle-cli GET user:name
 # Alice
 
-wavicle-cli GET user:name           # Hot cache. Version vector matches. 83ns.
+wavicle-cli MGET user:name user:email          # Batch get
+# 1) Alice
+# 2) a@t.com
+
+wavicle-cli HGET profile:1 theme              # Hash field get
+# dark
+
+wavicle-cli HGETALL profile:1                 # All hash fields
+# 1) theme
+# 2) dark
+# 3) lang
+# 4) go
+
+wavicle-cli GET user:name                      # Hot cache, 83ns, version vector match.
 # Alice
+```
+
+### Expiration
+
+```
+wavicle-cli EXPIRE user:email 3600
+# (integer) 1                                  # 1 = key exists, expiry set
+
+wavicle-cli TTL user:email
+# (integer) 3600                               # Seconds until expiry (dev mode: -1 = no TTL)
+
+wavicle-cli TTL missing:key
+# (integer) -2                                  # -2 = key does not exist
 ```
 
 ### Introspection
@@ -203,7 +236,14 @@ wavicle-cli DBSIZE
 |-----------|-------------|---------------|
 | `SET key value` | Appends a new immutable atom | ❌ None needed |
 | `GET key` | Checks version vector → re-render if stale | ❌ None needed |
+| `MSET key val [key val...]` | Batch atom append | ❌ None needed |
+| `MGET key [key...]` | Batch proof cache read | ❌ None needed |
+| `HSET key field val` | Hash field set → atom at key:field | ❌ None needed |
+| `HGET key field` | Hash field get from key:field | ❌ None needed |
+| `HGETALL key` | All hash fields via frontier prefix scan | ❌ None needed |
 | `DEL key` | Appends tombstone atom | ❌ None needed |
+| `EXPIRE key sec` | Sets TTL (dev: key exists check) | ❌ None needed |
+| `TTL key` | Returns -1 (no expiry) or -2 (missing) | ❌ None needed |
 | `EXISTS key` | Counts live keys | ❌ None needed |
 | `DBSIZE` | Counts live frontier entries | ❌ None needed |
 | `PING` | Health check | ❌ None needed |
@@ -231,9 +271,9 @@ Three tests prove zero stale reads under mutation. All pass.
 | Phase | Focus | Deliverables | Timeline |
 |-------|-------|-------------|----------|
 | **0 — Proof of Concept** | Core algorithm validated | 6 commands, Causal Crystal, 48x benchmarks, zero stale reads | ✅ **Done** |
-| **1 — DB Integration** | Attach to existing databases | PostgreSQL logical replication (Q3), MySQL binlog (Q4), SQL → proof tree mapping, Docker compose | **H2 2026** |
-| **2 — Production Ready** | Ship to design partners | Hash data type, TTL, MGET/MSET, Prometheus metrics, auth, 7-day soak test | **H1 2027** |
-| **3 — Enterprise** | Scale and sell | Multi-DB support, RBAC, SSO, audit, cloud marketplace | **H2 2027** |
+| **1 — DB Integration** | Attach to existing databases | ✅ Hash types, TTL, MSET/MGET, batch ops. 🔄 PG logical replication adapter, SQL → proof mapping, Docker compose | **Building** |
+| **2 — Production Ready** | Ship to design partners | Metrics, auth, config, graceful shutdown, 7-day soak test | **H1 2027** |
+| **3 — Enterprise** | Scale and sell | MySQL binlog, RBAC, SSO, audit, cloud marketplace | **H2 2027** |
 
 **The Causal Crystal** is the built-in development storage — it was used to validate the algorithm during Phase 0. In production deployment, Wavicle connects to your existing database. The Causal Crystal remains available for development, testing, and single-node embedded use cases.
 
@@ -250,11 +290,11 @@ Three tests prove zero stale reads under mutation. All pass.
 ### Not yet ready for
 | Scenario | Why | What's Needed |
 |----------|-----|---------------|
-| Production deployment | No Docker, config, auth, metrics | Phase 2 |
+| Production deployment | No auth, runbook, or SLA | Phase 2 |
 | Write-heavy workloads | Fsync bottleneck at ~1,200/sec in dev mode | Production mode (writes go to your database) |
-| Complex queries | Only 6 commands, no SQL parser | Phase 1 |
+| SQL query passthrough | Cache-on-read, need SELECT→proof mapping | Phase 2 |
 | Multi-node | Single-threaded, no sharding | Phase 3 |
-| Additional DB adapters | PostgreSQL first, MySQL and others later | Phase 3 |
+| MySQL / other DB adapters | PostgreSQL listener built, need more | Phase 3 |
 
 ---
 
@@ -276,8 +316,13 @@ wavicle/
 │   │   ├── crystal.go                   # CausalCrystal
 │   │   ├── wal.go                       # Write-ahead log
 │   │   └── frontier.go                  # Active Frontier Index
-│   ├── protocol/resp3/server.go         # RESP3 TCP server
+│   ├── protocol/resp3/server.go         # RESP3 TCP server (13 commands)
 │   ├── fidelity/policy.go               # Glob-path enforcement
+│   ├── replication/                     # DB change stream adapters
+│   │   ├── adapter.go                   #   ChangeListener interface, PathMapper
+│   │   └── postgres.go                  #   PG logical replication (pgoutput)
+│   ├── config/config.go                 # YAML configuration system
+│   ├── telemetry/metrics.go             # Prometheus-format metrics
 │   └── semantic/hrr.go                  # HRR vector operations
 ├── benchmarks/
 │   ├── proof_bench_test.go              # 5 reduction benchmarks
@@ -291,11 +336,15 @@ wavicle/
 
 | Operation | Time | Space |
 |-----------|------|-------|
-| Proof reduction (FP1, nothing changed) | O(m) | O(1) |
-| Proof reduction (FP2, Merkle match) | O(1) | O(1) |
-| Proof reduction (incremental, k changes) | O(k) | O(k) |
+| Atom append (with fsync) | O(1) amortized | O(1) |
+| Frontier read (hot, any key) | O(1) | O(1) |
+| Proof reduction — FastPath1 (version vector match) | O(m) | O(1) |
+| Proof reduction — FastPath2 (Merkle root match) | O(1) | O(1) |
+| Proof reduction — Incremental (k changes out of m deps) | O(k) | O(k) |
 | Proof composition (cold) | O(n) | O(n) |
-| Version vector check | O(m) | O(m) |
+| MGET (batch read) | O(p × FP1) | O(p) |
+| HSET / HGET (hash field) | O(1) | O(1) |
+| HGETALL (all hash fields) | O(f) | O(f) |
 
 ---
 

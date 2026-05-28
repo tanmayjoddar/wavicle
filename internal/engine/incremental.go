@@ -185,5 +185,24 @@ func mergeInto(target core.VRecord, val core.Value) {
 }
 
 func applyCombinator(f, a core.Value) (core.Value, error) {
-	return a, nil
+	// K(x)(y) = x — constant combinator
+	switch v := f.(type) {
+	case core.VString:
+		if string(v) == "K" {
+			return a, nil
+		}
+		return core.VRecord{"fn": v, "arg": a}, nil
+	case core.VRecord:
+		// Unwrap single-entry record
+		if len(v) == 1 {
+			for _, val := range v {
+				if s, ok := val.(core.VString); ok && string(s) == "K" {
+					return a, nil
+				}
+			}
+		}
+		return v, nil
+	default:
+		return core.VRecord{"fn": f, "arg": a}, nil
+	}
 }

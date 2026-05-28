@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -177,8 +178,15 @@ type EEmbed struct {
 func (e *EEmbed) exprTag()    {}
 func (e *EEmbed) Level() int { return 1 }
 func (e *EEmbed) Serialize() []byte {
-	// ... implementation
-	return []byte{2}
+	// Level(1) + ModelVersion(2 bytes) + Vector(1024 bytes)
+	b := make([]byte, 0, 1+2+1024)
+	b = append(b, 2)
+	binary.BigEndian.PutUint16(b[1:3], e.ModelVersion)
+	for _, v := range e.Vector {
+		bits := math.Float32bits(v)
+		b = binary.BigEndian.AppendUint32(b, bits)
+	}
+	return b
 }
 func (e *EEmbed) ExprHash() Hash {
 	return sha3.Sum256(e.Serialize())
@@ -222,7 +230,16 @@ type EResonate struct {
 func (e *EResonate) exprTag()    {}
 func (e *EResonate) Level() int { return 3 }
 func (e *EResonate) Serialize() []byte {
-	return []byte{5}
+	// Level(3) tag + query vector count(4 bytes) + vectors
+	b := []byte{5, 0, 0, 0, 0} // tag + 4 bytes for count
+	binary.BigEndian.PutUint32(b[1:5], uint32(len(e.Queries)))
+	for _, q := range e.Queries {
+		for _, v := range q {
+			bits := math.Float32bits(v)
+			b = binary.BigEndian.AppendUint32(b, bits)
+		}
+	}
+	return b
 }
 func (e *EResonate) ExprHash() Hash {
 	return sha3.Sum256(e.Serialize())

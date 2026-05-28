@@ -223,8 +223,30 @@ func embedExpression(expr core.CombinatorExpr) core.Vector {
 }
 
 func inferDomain(path string) core.Domain {
-	// Simple domain inference based on path prefix
-	return core.DomainSystem
+	// Domain inference from path prefix
+	if path == "" {
+		return core.DomainSystem
+	}
+	domain := path[0]
+	switch {
+	case domain == 'u' || domain == 'U':
+		return core.DomainUser
+	case domain == 'o' || domain == 'O':
+		return core.DomainOrder
+	case domain == 'p' || domain == 'P':
+		return core.DomainProduct
+	case domain == 's' || domain == 'S':
+		if len(path) > 3 && (path[:3] == "ses" || path[:3] == "SES" || path[:3] == "Ses") {
+			return core.DomainSession
+		}
+		return core.DomainSystem
+	case domain == 'a' || domain == 'A':
+		return core.DomainAnalytics
+	case domain == 'c' || domain == 'C':
+		return core.DomainConfig
+	default:
+		return core.DomainSystem
+	}
 }
 
 func randomNonce() [16]byte {
