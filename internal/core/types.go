@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"golang.org/x/crypto/sha3"
@@ -122,11 +123,15 @@ type VRecord map[string]Value
 func (v VRecord) valueTag()    {}
 func (v VRecord) Type() string { return "record" }
 func (v VRecord) Serialize() []byte {
-	// Sort keys for deterministic serialization would be better
+	keys := make([]string, 0, len(v))
+	for k := range v {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	var b []byte
-	for k, val := range v {
+	for _, k := range keys {
 		b = append(b, []byte(k)...)
-		b = append(b, val.Serialize()...)
+		b = append(b, v[k].Serialize()...)
 	}
 	return b
 }
