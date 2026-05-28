@@ -149,14 +149,66 @@ The 48x speedup comes from the node cache: 49 of 50 unchanged atoms are served i
 
 ## Commands
 
-| Command | Response | Description |
-|---------|----------|-------------|
-| `PING` | `PONG` | Server health check |
-| `SET key value` | `OK` | Writes to storage (Causal Crystal in dev mode, your database in production) |
-| `GET key` | value or `(nil)` | Proof cache → incremental reduce → cold compose |
-| `DEL key [keys...]` | `(integer) N` | Appends tombstone atom |
-| `EXISTS key [keys...]` | `(integer) N` | Count of live keys |
-| `DBSIZE` | `(integer) N` | Count of live frontier entries |
+### The Key Insight: There Is No Invalidate Command
+
+Every traditional cache has an explicit invalidation mechanism — TTL, pub/sub, or a manual `INVALIDATE` endpoint. Engineers write invalidation code and sometimes forget lines. That's where stale data comes from.
+
+Wavicle has **zero invalidation commands.** Staleness is detected automatically at read time. Every write creates a new immutable atom. Every cached proof carries a version vector — a receipt of everything it depended on. On the next read, that receipt is checked against the current state. If nothing changed, the cached value is returned in 83ns. If something changed, only the affected sub-expressions are re-reduced.
+
+No TTL to tune. No pub/sub to wire up. No invalidate to forget.
+
+### Write Path
+
+```
+# Every SET creates a new atom. Old atoms stay — nothing is overwritten.
+# Staleness is detected at read time, not written away.
+wavicle-cli SET user:name "Alice"
+# OK
+
+wavicle-cli SET user:name "Bob"     # Same key, new atom. Previous atom still exists.
+# OK                                    # Cache auto-detects the change on next read.
+
+wavicle-cli DEL user:name           # Appends tombstone atom. History preserved.
+# (integer) 1
+```
+
+### Read Path
+
+```
+# GET checks: "did any dependency change since I was cached?"
+# If no → return cached value (83ns). If yes → re-reduce only what changed.
+wavicle-cli GET user:name
+# Alice
+
+wavicle-cli GET user:name           # Hot cache. Version vector matches. 83ns.
+# Alice
+```
+
+### Introspection
+
+```
+wavicle-cli PING
+# PONG
+
+wavicle-cli EXISTS user:name
+# (integer) 0                      # Tombstoned keys return 0
+
+wavicle-cli DBSIZE
+# (integer) N                      # Live (non-tombstoned) entries
+```
+
+### Summary
+
+| Operation | What Happens | Invalidation? |
+|-----------|-------------|---------------|
+| `SET key value` | Appends a new immutable atom | ❌ None needed |
+| `GET key` | Checks version vector → re-render if stale | ❌ None needed |
+| `DEL key` | Appends tombstone atom | ❌ None needed |
+| `EXISTS key` | Counts live keys | ❌ None needed |
+| `DBSIZE` | Counts live frontier entries | ❌ None needed |
+| `PING` | Health check | ❌ None needed |
+
+Every column says the same thing: **no invalidation needed.** It's not a missing feature — it's the entire point.
 
 Wire protocol is **RESP3**. Wavicle includes its own `wavicle-cli` tool, but any RESP3-compatible client can connect.
 
