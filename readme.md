@@ -231,7 +231,6 @@ wavicle/
 │   ├── proof_bench_test.go              # 5 reduction benchmarks
 │   └── load_test.go                     # Concurrency benchmarks
 ├── blueprint.md                         # Full architectural spec
-└── WAVICLE_GRAPH.md                     # LLM system graph (local only)
 ```
 
 ---
