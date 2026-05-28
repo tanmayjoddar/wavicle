@@ -1,0 +1,97 @@
+package storage
+
+import (
+	"database/sql"
+	"fmt"
+	"strings"
+	"wavicle/internal/core"
+
+	_ "github.com/lib/pq"
+)
+
+// PostgresStore implements the Store interface for a PostgreSQL backend.
+type PostgresStore struct {
+	db *sql.DB
+}
+
+func NewPostgresStore(dsn string) (*PostgresStore, error) {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
+	return &PostgresStore{db: db}, nil
+}
+
+func (s *PostgresStore) AppendAtom(expr core.CombinatorExpr, path string, parents []core.Hash) (core.Hash, error) {
+	// Phase 1: SET key value -> UPDATE table
+	parts := strings.Split(path, ":")
+	if len(parts) < 3 {
+		return core.Hash{}, fmt.Errorf("invalid path format for Postgres: %s (expected table:id:column)", path)
+	}
+
+	table := parts[0]
+	id := parts[1]
+	column := parts[2]
+
+	var val any
+	if ec, ok := expr.(*core.EConst); ok {
+		val = ec.Value
+	} else {
+		return core.Hash{}, fmt.Errorf("only EConst expressions are supported for Postgres writes in Phase 1")
+	}
+
+	// Use UPSERT if possible, or just UPDATE for Phase 1
+	query := fmt.Sprintf("INSERT INTO %s (id, %s) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET %s = $2", table, column, column)
+	_, err := s.db.Exec(query, id, val)
+	if err != nil {
+		return core.Hash{}, fmt.Errorf("postgres upsert: %w", err)
+	}
+
+	return core.Hash{}, nil
+}
+
+func (s *PostgresStore) GetCurrent(path string) (*core.CausalAtom, bool) {
+	// Fallback SELECT to seed the local Crystal on first miss
+	parts := strings.Split(path, ":")
+	if len(parts) < 3 {
+		return nil, false
+	}
+
+	table := parts[0]
+	id := parts[1]
+	column := parts[2]
+
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE id = $1", column, table)
+	var val string
+	err := s.db.QueryRow(query, id).Scan(&val)
+	if err != nil {
+		return nil, false
+	}
+
+	// Return a temporary atom. In main.go, the server should detect this 
+	// and seed the Crystal. Or we could seed it here if we had access to the Crystal.
+	// Since Store is abstract, we return an atom that the caller can use.
+	return &core.CausalAtom{
+		Path: path,
+		Expr: &core.EConst{Value: core.VString(val)},
+	}, true
+}
+
+func (s *PostgresStore) GetParents(hash core.Hash) ([]core.Hash, bool) {
+	return nil, false
+}
+
+func (s *PostgresStore) GetAtom(hash core.Hash) (*core.CausalAtom, bool) {
+	return nil, false
+}
+
+func (s *PostgresStore) FrontierPaths() []string {
+	return nil
+}
+
+func (s *PostgresStore) Close() error {
+	return s.db.Close()
+}
