@@ -207,35 +207,49 @@ Three tests prove zero stale reads under mutation. All pass.
 
 ```
 wavicle/
-├── main.go                          # Server entry point
-├── cmd/wavicle-cli/main.go          # CLI tool
+├── main.go                                    # Server entry point
+├── main_test.go                               # End-to-end RESP3 test
+│
+├── cmd/
+│   └── wavicle-cli/main.go                    # CLI client (146 lines)
+│
 ├── internal/
-│   ├── core/types.go                # Core types: Hash, Value, CausalAtom
-│   ├── storage/
-│   │   ├── crystal.go               # CausalCrystal — the storage engine
-│   │   ├── wal.go                   # Write-ahead log, fsync, crash recovery
-│   │   ├── frontier.go              # Active Frontier Index (path → hash)
-│   │   ├── parent_index.go          # Parent Index (hash → parents)
-│   │   └── merkle.go                # Binary Merkle Tree (SHA3-256)
-│   ├── engine/
-│   │   ├── proof.go                 # MaterializedProof + VersionVector
-│   │   ├── compose.go               # Cold proof composition
-│   │   ├── incremental.go           # Incremental reduction (core algorithm)
-│   │   ├── version_vector.go        # Merkle root computation
-│   │   ├── cache.go                 # Sharded LRU proof cache
-│   │   └── engine_test.go           # Correctness tests
-│   ├── protocol/resp3/server.go     # TCP RESP3 server + command handlers
-│   ├── fidelity/policy.go           # Glob-path consistency enforcement
-│   ├── autopoiesis/
-│   │   ├── diffraction.go           # Merkle tree value decomposition
-│   │   └── entanglement.go          # Lift + chi-squared statistics
-│   └── semantic/hrr.go              # HRR vector ops, string embeddings
+│   ├── core/
+│   │   └── types.go                           # Hash, Value, CausalAtom, CombinatorExpr
+│   │
+│   ├── storage/                               # THE DATABASE
+│   │   ├── crystal.go                         # CausalCrystal — appendAtom, GetCurrent, Recover
+│   │   ├── wal.go                             # Write-ahead log (JSON lines + fsync)
+│   │   ├── frontier.go                        # Active Frontier Index (path → hash, O(1))
+│   │   ├── parent_index.go                    # Parent Index (hash → parents, O(1))
+│   │   └── merkle.go                          # Binary Merkle Tree (SHA3-256)
+│   │
+│   ├── engine/                                # THE COMPUTATION
+│   │   ├── proof.go                           # MaterializedProof + VersionVector
+│   │   ├── compose.go                         # Cold proof composition (causal closure walk)
+│   │   ├── incremental.go                     # ★ Incremental reduction (3 fast paths)
+│   │   ├── version_vector.go                  # Merkle root computation for VV
+│   │   ├── cache.go                           # Sharded LRU proof cache
+│   │   └── engine_test.go                     # 3 correctness tests (PoisonWrite, RAW, ConsecWrites)
+│   │
+│   ├── protocol/resp3/server.go               # TCP server + 6 command handlers
+│   ├── fidelity/policy.go                     # Glob-path consistency enforcement
+│   │
+│   ├── autopoiesis/                           # DEPENDENCY DISCOVERY
+│   │   ├── diffraction.go                     # Merkle tree value decomposition
+│   │   └── entanglement.go                    # Lift + chi-squared statistics
+│   │
+│   └── semantic/
+│       └── hrr.go                             # HRR ops, cosine similarity, string embeddings
+│
 ├── benchmarks/
-│   ├── proof_bench_test.go          # Reduction benchmarks
-│   └── load_test.go                 # Concurrency benchmarks
-├── PRODUCTION_ROADMAP.md            # Full go-to-market plan
-├── blueprint.md                     # Architectural specification
-└── WAVICLE_GRAPH.md                 # Complete system graph
+│   ├── proof_bench_test.go                    # 5 reduction benchmarks (cold, warm, fast paths)
+│   └── load_test.go                           # Concurrency + throughput benchmarks
+│
+├── go.mod / go.sum                            # Module: wavicle, dependency: x/crypto (SHA3-256)
+├── PRODUCTION_ROADMAP.md                      # 3-phase go-to-market plan
+├── blueprint.md                               # Full architectural specification
+└── WAVICLE_GRAPH.md                           # Complete system graph for LLMs
 ```
 
 ---
