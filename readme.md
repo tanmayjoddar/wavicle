@@ -126,7 +126,7 @@ $ ./wavicle-cli GET user:name
 (nil)
 ```
 
-Standalone mode uses Wavicle's built-in storage (Causal Crystal) for development. Production deployment attaches to your existing database — see the roadmap.
+Wavicle comes with its own built-in storage (Causal Crystal) so you can run it immediately with zero setup. No external dependencies required.
 
 ---
 
