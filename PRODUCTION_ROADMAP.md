@@ -64,49 +64,56 @@ Building a new database is a 5-10 year, multi-million dollar bet. The switching 
 
 **But everyone has cache invalidation problems.** And they pay money to fix it — in engineering hours, operational complexity, and stale-data incidents.
 
-Wavicle eliminates cache invalidation without replacing the database. It sits in front of your existing PostgreSQL/MySQL, serves cached proofs at 83ns hot reads, and auto-invalidates (auto-recomputes) when underlying data changes via change tracking.
+Wavicle eliminates cache invalidation without replacing the database. It sits in front of your existing database, serves cached proofs at 83ns hot reads, and auto-invalidates (auto-recomputes) when underlying data changes via change stream listeners.
 
 ### The Product
 
 ```
-Your App → RESP3 (Redis protocol) → Wavicle Proof Cache → PostgreSQL / MySQL
+Your App → RESP3 (Redis protocol) → Wavicle Proof Cache → Your Database
                                        ↓
-                                 Change stream listener
-                                 (logical replication / binlog)
+                                 DB Adapter Layer
+                                 (PG logical replication,
+                                  MySQL binlog, etc.)
                                        ↓
                                  Auto-incrementally re-reduce
                                  only the affected cached proofs
 ```
 
-**What you sell:** "Eliminate cache invalidation for your PostgreSQL database. Drop-in Redis protocol replacement. Zero code changes. Zero stale reads."
+**What you sell:** "Eliminate cache invalidation for your existing database. Drop-in Redis protocol replacement. Zero code changes. Zero stale reads."
 
 **What you don't sell:** A new database.
 
 ### The Moat
 
-The Proof Engine — specifically the incremental reduction algorithm with version vector staleness detection. This is not a Redis wrapper. It's a new way of thinking about cache consistency that no existing product provides.
+The Proof Engine — specifically the incremental reduction algorithm with version vector staleness detection. This is not a Redis wrapper or a database proxy. It's a new way of thinking about cache consistency that no existing product provides. The algorithm is database-agnostic — it works the same whether the data comes from PostgreSQL, MySQL, SQLite, or any source that provides a change stream.
 
 ---
 
-## PART III: PHASE 1 — PostgreSQL Caching Layer (Months 1-3)
+## PART III: PHASE 1 — Database Integration (Months 1-4)
 
 ### Goal
-Wavicle serves as a smart caching layer for PostgreSQL. The Proof Engine detects stale cached data via PostgreSQL logical replication. One design partner in staging.
+Wavicle attaches to your existing database as a smart caching layer. PostgreSQL (logical replication) first, MySQL (binlog) second. One design partner in staging.
 
 ### Target Workload
-**Read-heavy API backends with PostgreSQL:**
+**Read-heavy API backends with any SQL database:**
 - High read ratio (90%+)
-- Composite objects assembled from multiple SQL queries
+- Composite objects assembled from multiple queries
 - Existing Redis cache with manual invalidation pain
-- No desire to change the primary database
+- Zero desire to change the primary database
 
 ### Required Features
 
-#### 1.1 PostgreSQL Logical Replication Listener (Week 1-3)
+#### 1.1 Database Change Listener (Weeks 1-4)
 
-Wavicle subscribes to PostgreSQL's change stream and uses it to detect stale cached proofs.
+Wavicle subscribes to your database's change stream and detects stale cached proofs.
 
 ```go
+// DB Adapter interface — one implementation per database
+type ChangeListener interface {
+    Start(ctx context.Context) (<-chan ChangeEvent, error)
+    Close() error
+}
+
 type ChangeEvent struct {
     Table        string            // e.g. "users"
     Action       string            // INSERT, UPDATE, DELETE
@@ -116,16 +123,22 @@ type ChangeEvent struct {
 }
 ```
 
-**Implementation:** Use `pgoutput` plugin (PG 10+ logical replication). Wavicle creates a replication slot and publication. Each table change is mapped to affected cache paths via configurable rules. The Proof Engine receives events and incrementally re-reduces affected proofs.
+**Planned adapters:**
+| Database | Mechanism | Priority |
+|----------|-----------|----------|
+| PostgreSQL | Logical replication (`pgoutput`, PG 10+) | P0 (first) |
+| MySQL | Binlog replication | P1 (second) |
+| SQLite | Trigger-based change hook | P2 |
+| MongoDB | Change streams | P3 |
 
 **PostgreSQL setup (one-time):**
 ```sql
 CREATE PUBLICATION wavicle_proofs FOR TABLE users, profiles, sessions;
 ```
 
-#### 1.2 SQL Query Parser → Proof Tree (Week 3-5)
+#### 1.2 SQL Query Parser → Proof Tree (Weeks 3-6)
 
-Maps SQL SELECT queries to proof expressions. When a cache miss occurs, parse the SQL, extract table/column dependencies, and build a proof tree.
+Maps SELECT queries to proof expressions. When a cache miss occurs, parse the SQL, extract table/column dependencies, and build a proof tree.
 
 ```go
 // SELECT name, email FROM users WHERE id = 123
@@ -141,7 +154,7 @@ Maps SQL SELECT queries to proof expressions. When a cache miss occurs, parse th
 
 **Implementation:** Parse SQL with a lightweight parser, extract table names and WHERE clauses, build proof trees where each atom maps to a table row field.
 
-#### 1.3 Core Commands (Month 1-2)
+#### 1.3 Core Commands (Month 2)
 
 | Priority | Command | Source |
 |----------|---------|--------|
@@ -152,7 +165,7 @@ Maps SQL SELECT queries to proof expressions. When a cache miss occurs, parse th
 | P0 | MGET / MSET | Batch operations |
 | P1 | EXPIRE / TTL | Session expirations via PG timestamps |
 
-#### 1.4 Docker + Docker Compose (Week 5-6)
+#### 1.4 Docker + Docker Compose (Weeks 5-6)
 
 ```yaml
 version: '3.8'
@@ -163,11 +176,15 @@ services:
       - "6379:6379"   # RESP3 protocol
       - "8080:8080"   # Prometheus metrics
     environment:
-      - WAVICLE_PG_DSN=postgres://user:pass@postgres:5432/mydb
+      - WAVICLE_DB_TYPE=postgresql  # or mysql, sqlite
+      - WAVICLE_DB_DSN=postgres://user:pass@db:5432/mydb
 
-  postgres:
-    image: postgres:16
-    command: -c wal_level=logical -c max_replication_slots=5
+  db:
+    image: postgres:16  # or mysql:8, etc.
+    environment:
+      POSTGRES_DB: mydb
+    # PG needs logical replication enabled:
+    # command: -c wal_level=logical -c max_replication_slots=5
 ```
 
 #### 1.5 Telemetry (Week 5-6)
@@ -182,27 +199,29 @@ CacheMissSQLCount    = counter
 #### 1.6 Configuration
 
 ```yaml
-engine:
-  type: postgres
-  postgres:
+wavicle:
+  db:
+    type: postgresql      # postgresql, mysql, sqlite
     dsn: "postgres://user:pass@localhost:5432/mydb"
     table_mappings:
       - table: "users"
         key_template: "users:${id}"
         columns: ["name", "email"]
+
   proof_cache:
     max_entries: 100000
+    max_bytes: "200MB"
 ```
 
 ### Phase 1 Exit Criteria
 
 | Criterion | Target | Measurement |
 |-----------|--------|-------------|
-| PostgreSQL integration | Change stream consumed, proofs invalidated on PG writes | UPDATE in psql → stale proof re-reduced |
+| DB change listener | At least one DB adapter working (PG) | UPDATE in DB → stale proof re-reduced |
 | SQL → Proof mapping | SELECT queries mapped to proof trees | Test: SQL → proof cache hit |
 | Proof cache hit rate | >90% after warmup | Prometheus |
-| Replication lag | <100ms p99 | PGReplicationLag metric |
-| Docker compose | Working with PostgreSQL | Manual test |
+| Replication lag | <100ms p99 | Metric per adapter |
+| Docker compose | Working with DB backend | Manual test |
 | Design partner | 1 company in staging | Signed agreement |
 
 ---
@@ -249,16 +268,24 @@ The Causal Crystal remains available for development and testing. In production 
 
 ---
 
-## PART V: PHASE 3 — MySQL + Enterprise (Months 7-12)
+## PART V: PHASE 3 — Multi-DB + Enterprise (Months 7-12)
 
 ### Goal
-Expand to MySQL. Enterprise features. Cloud marketplace.
+Support all major databases. Enterprise features. Cloud marketplace.
 
 ### Required Features
 
-#### 3.1 MySQL Binlog Listener
+#### 3.1 Expand Database Adapters
 
-MySQL change tracking via binary log replication. Same Proof Engine integration, different wire protocol for change capture.
+| Database | Mechanism | Status |
+|----------|-----------|--------|
+| PostgreSQL | Logical replication (`pgoutput`) | Phase 1 |
+| MySQL | Binlog replication | Phase 3 |
+| SQLite | Trigger-based change hook | Phase 3 |
+| MongoDB | Change streams | Phase 3 |
+| SQL Server | Change tracking | Future |
+
+All adapters use the same `ChangeListener` interface. The Proof Engine is database-agnostic — it processes `ChangeEvent` structs the same way regardless of source.
 
 #### 3.2 Enterprise
 

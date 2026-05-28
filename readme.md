@@ -56,9 +56,9 @@ graph TB
     RESP -->|SET/DEL| CRYSTAL
 ```
 
-### Planned — Smart Cache for PostgreSQL/MySQL
+### Planned — Smart Cache for Your Database
 
-The production architecture attaches Wavicle to your existing database via change tracking.
+The production architecture attaches Wavicle to your existing database via change tracking. PostgreSQL (logical replication) is the first supported backend; MySQL (binlog) and others follow.
 
 ```mermaid
 graph TB
@@ -66,32 +66,32 @@ graph TB
         APP["Application<br/>Zero code changes"]
     end
 
-    subgraph "Wavicle"
+    subgraph "Wavicle — Proof Cache Layer"
         RESP["RESP3 Server<br/>TCP :6379"]
         PE["Proof Engine"]
         PC["Proof Cache<br/>83ns hot reads"]
-        SQ["SQL Query Builder"]
+        ADAPT["DB Adapter<br/>(PG logical replication,<br/>MySQL binlog, etc.)"]
     end
 
     subgraph "Your Existing Database"
-        PG["PostgreSQL / MySQL"]
-        WG["Change Stream<br/>(logical replication / binlog)"]
+        DB["PostgreSQL / MySQL / etc."]
+        CH["Change Stream"]
     end
 
     APP -->|"GET key"| RESP
     APP -->|"SET key"| RESP
     RESP --> PE
     PE --> PC
-    PC -->|"cache miss"| SQ --> PG
-    WG -->|"change notification"| PE
-    PE -->|"incrementally re-reduce affected proofs"| PC
+    PC -->|"cache miss"| ADAPT --> DB
+    CH -->|"change events"| ADAPT --> PE
+    PE -->|"incrementally re-reduce"| PC
 ```
 
 **Change tracking flow:**
-1. Application writes to PostgreSQL normally
-2. PostgreSQL logical replication stream sends changes to Wavicle
-3. Wavicle identifies which cached proofs depend on the changed data
-4. Those proofs are incrementally re-reduced — only the affected sub-expressions are recomputed
+1. Application writes to its database normally (Wavicle is read-heavy, writes go to the DB)
+2. The database's change stream (logical replication, binlog, etc.) sends changes to Wavicle
+3. Wavicle identifies which cached proofs depend on the changed data via version vector comparison
+4. Only the affected sub-expressions are incrementally re-reduced (48x faster than full recompute)
 5. Next read hits the proof cache at 83ns with zero stale data
 
 ---
@@ -126,7 +126,7 @@ $ ./wavicle-cli GET user:name
 (nil)
 ```
 
-The standalone mode uses Wavicle's built-in storage (Causal Crystal) for development. PostgreSQL/MySQL integration is coming in Phase 1 — see the roadmap.
+Standalone mode uses Wavicle's built-in storage (Causal Crystal) for development. Production deployment attaches to your existing database — see the roadmap.
 
 ---
 
@@ -152,7 +152,7 @@ The 48x speedup comes from the node cache: 49 of 50 unchanged atoms are served i
 | Command | Response | Description |
 |---------|----------|-------------|
 | `PING` | `PONG` | Server health check |
-| `SET key value` | `OK` | Writes to storage (Causal Crystal in dev mode, PostgreSQL in production) |
+| `SET key value` | `OK` | Writes to storage (Causal Crystal in dev mode, your database in production) |
 | `GET key` | value or `(nil)` | Proof cache → incremental reduce → cold compose |
 | `DEL key [keys...]` | `(integer) N` | Appends tombstone atom |
 | `EXISTS key [keys...]` | `(integer) N` | Count of live keys |
@@ -178,10 +178,10 @@ Three tests prove zero stale reads under mutation. All pass.
 
 | Phase | Focus | Deliverables | Timeline |
 |-------|-------|-------------|----------|
-| **0 — Proof of Concept** | Core algorithm validated | 6 commands, standalone Causal Crystal, 48x benchmarks, zero stale reads proven | ✅ **Done** |
-| **1 — PostgreSQL Proxy** | Wavicle as caching layer for PostgreSQL | PostgreSQL logical replication listener, SQL query parser → proof tree, proof cache backed by PG change stream, Docker compose with PG | **Q3 2026** |
-| **2 — Production Ready** | Ship to design partners | Hash data type, TTL/EXPIRE, MGET/MSET, Prometheus metrics, configuration, auth, 7-day soak test | **Q4 2026** |
-| **3 — MySQL + Enterprise** | Expand database support | MySQL binlog listener, enterprise features (RBAC, SSO, audit), cloud marketplace | **Q1 2027** |
+| **0 — Proof of Concept** | Core algorithm validated | 6 commands, Causal Crystal, 48x benchmarks, zero stale reads | ✅ **Done** |
+| **1 — DB Integration** | Attach to existing databases | PostgreSQL logical replication (Q3), MySQL binlog (Q4), SQL → proof tree mapping, Docker compose | **H2 2026** |
+| **2 — Production Ready** | Ship to design partners | Hash data type, TTL, MGET/MSET, Prometheus metrics, auth, 7-day soak test | **H1 2027** |
+| **3 — Enterprise** | Scale and sell | Multi-DB support, RBAC, SSO, audit, cloud marketplace | **H2 2027** |
 
 **The Causal Crystal** (standalone storage engine) was Phase 0 infrastructure used to validate the algorithm. In production deployment, Wavicle attaches to your existing PostgreSQL/MySQL database. The Causal Crystal remains available for development, testing, and embedded use cases.
 
