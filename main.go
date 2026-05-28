@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"wavicle/internal/config"
+	"wavicle/internal/core"
 	"wavicle/internal/protocol/resp3"
+	"wavicle/internal/replication"
 	"wavicle/internal/storage"
 	"wavicle/internal/telemetry"
 )
@@ -16,6 +20,9 @@ import (
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmsgprefix)
 	log.SetPrefix("[wavicle] ")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	cfg := config.Default()
 
@@ -31,7 +38,54 @@ func main() {
 		log.Fatalf("Failed to initialize storage: %v", err)
 	}
 
-	srv := resp3.NewServer(crystal)
+	var store storage.Store = crystal
+
+	// Phase 1: Enable external database integration
+	if cfg.DB.Type == "postgres" {
+		log.Printf("Initializing PostgreSQL write-through to %s", cfg.DB.DSN)
+		pgStore, err := storage.NewPostgresStore(cfg.DB.DSN)
+		if err != nil {
+			log.Fatalf("Failed to connect to Postgres: %v", err)
+		}
+		store = storage.NewWriteThroughStore(pgStore, crystal)
+
+		// Start Replication Listener
+		pgListener := replication.NewPGListener(replication.PGConfig{
+			DSN:             cfg.DB.DSN,
+			ReplicationSlot: cfg.DB.ReplicationSlot,
+			Publication:     cfg.DB.Publication,
+			TableMappings:   mapConfigToMappers(cfg.DB.TableMappings),
+		})
+
+		events, err := pgListener.Start(ctx)
+		if err != nil {
+			log.Printf("Warning: Failed to start PG replication: %v", err)
+		} else {
+			go func() {
+				for evt := range events {
+					for _, path := range evt.AffectedPaths {
+						log.Printf("DB Change [%s]: path %s", evt.Action, path)
+						
+						if evt.Action == "DELETE" {
+							crystal.AppendAtom(&core.EConst{Value: core.VNull{}}, path, nil)
+						} else {
+							// For Phase 1, we find the column name from the end of the path
+							lastColon := strings.LastIndex(path, ":")
+							if lastColon != -1 {
+								column := path[lastColon+1:]
+								if val, ok := evt.NewValues[column]; ok {
+									expr := &core.EConst{Value: core.VString(fmt.Sprint(val))}
+									crystal.AppendAtom(expr, path, nil)
+								}
+							}
+						}
+					}
+				}
+			}()
+		}
+	}
+
+	srv := resp3.NewServer(store)
 
 	// Start metrics HTTP server
 	if cfg.Metrics.Enabled {
@@ -41,8 +95,6 @@ func main() {
 				log.Printf("Metrics server error: %v", err)
 			}
 		}()
-	} else {
-		log.Println("Metrics disabled (enable with metrics.enabled)")
 	}
 
 	// Start the RESP3 server in background
@@ -59,6 +111,18 @@ func main() {
 	sig := <-sigCh
 	log.Printf("Received signal %v, shutting down...", sig)
 
-	crystal.Close()
+	store.Close()
 	log.Println("Shutdown complete.")
+}
+
+func mapConfigToMappers(cfg []config.TableMapping) []replication.PathMapper {
+	mappers := make([]replication.PathMapper, len(cfg))
+	for i, m := range cfg {
+		mappers[i] = replication.PathMapper{
+			Table:       m.Table,
+			KeyTemplate: m.KeyTemplate,
+			Columns:     m.Columns,
+		}
+	}
+	return mappers
 }
