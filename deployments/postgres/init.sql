@@ -16,6 +16,7 @@ CREATE TABLE users (
     email TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+ALTER TABLE users REPLICA IDENTITY FULL;
 
 CREATE TABLE products (
     id TEXT PRIMARY KEY,
@@ -23,6 +24,7 @@ CREATE TABLE products (
     price_cents INTEGER,
     stock_count INTEGER
 );
+ALTER TABLE products REPLICA IDENTITY FULL;
 
 -- 5. Seed some data
 INSERT INTO users (id, name, email) VALUES ('123', 'Alice', 'alice@example.com');

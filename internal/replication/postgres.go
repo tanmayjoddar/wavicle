@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,7 +100,17 @@ func (l *PGListener) run(ctx context.Context) {
 }
 
 func (l *PGListener) connectAndConsume(ctx context.Context) error {
-	conn, err := pgconn.Connect(ctx, l.config.DSN)
+	// Replication connections require replication=database in the DSN
+	replDSN := l.config.DSN
+	if !strings.Contains(replDSN, "replication=") {
+		if strings.Contains(replDSN, "?") {
+			replDSN += "&replication=database"
+		} else {
+			replDSN += "?replication=database"
+		}
+	}
+
+	conn, err := pgconn.Connect(ctx, replDSN)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -325,12 +336,17 @@ func (l *PGListener) mapRow(table string, values map[string]any) []string {
 	if len(values) == 0 {
 		return nil
 	}
+	// Strip schema prefix: "public.users" → "users"
+	shortTable := table
+	if idx := strings.LastIndex(table, "."); idx != -1 {
+		shortTable = table[idx+1:]
+	}
 	for _, m := range l.mappers {
-		if m.Table == table {
+		if m.Table == shortTable {
 			return m.MapRowToPaths("", values)
 		}
 	}
-	return autoPathMapping(table, values)
+	return autoPathMapping(shortTable, values)
 }
 
 // autoPathMapping generates cache paths when no explicit mapping exists.
