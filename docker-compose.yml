@@ -4,13 +4,37 @@ services:
   wavicle:
     build: .
     ports:
-      - "6379:6379"
-      - "8080:8080"
+      - "6379:6379"   # RESP3
+      - "8080:8080"   # Metrics
+    depends_on:
+      - db
+    environment:
+      - WAVICLE_STORAGE_ENGINE=postgres
+      - WAVICLE_DB_TYPE=postgres
+      - WAVICLE_DB_DSN=postgres://wavicle:wavicle@db:5432/wavicle?sslmode=disable
+      - WAVICLE_METRICS_ENABLED=true
     volumes:
       - wavicle-data:/var/lib/wavicle
+
+  db:
+    image: postgres:16-alpine
     environment:
-      - WAVICLE_METRICS_ENABLED=true
-    restart: unless-stopped
+      - POSTGRES_USER=wavicle
+      - POSTGRES_PASSWORD=wavicle
+      - POSTGRES_DB=wavicle
+    ports:
+      - "5432:5432"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=5"
+      - "-c"
+      - "max_wal_senders=5"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
 
 volumes:
   wavicle-data:
+  postgres-data:
