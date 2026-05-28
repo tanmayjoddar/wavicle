@@ -128,14 +128,14 @@ func (c *CausalCrystal) GetCurrent(path string) (*core.CausalAtom, bool) {
 	if !ok {
 		return nil, false
 	}
-	return c.GetAtomByHash(hash)
+	return c.GetAtom(hash)
 }
 
 func (c *CausalCrystal) GetCurrentHash(path string) (core.Hash, bool) {
 	return c.frontier.Get(path)
 }
 
-func (c *CausalCrystal) GetAtomByHash(hash core.Hash) (*core.CausalAtom, bool) {
+func (c *CausalCrystal) GetAtom(hash core.Hash) (*core.CausalAtom, bool) {
 	if atom, ok := c.atomCache.Load(hash); ok {
 		return atom.(*core.CausalAtom), true
 	}
