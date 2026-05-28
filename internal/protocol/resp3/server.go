@@ -12,17 +12,18 @@ import (
 	"wavicle/internal/engine"
 	"wavicle/internal/fidelity"
 	"wavicle/internal/storage"
+	"wavicle/internal/telemetry"
 )
 
 type Server struct {
-	crystal    *storage.CausalCrystal
+	store      storage.Store
 	proofCache *engine.ProofCache
 	policy     *fidelity.FidelityPolicy
 }
 
-func NewServer(crystal *storage.CausalCrystal) *Server {
+func NewServer(store storage.Store) *Server {
 	return &Server{
-		crystal:    crystal,
+		store:      store,
 		proofCache: engine.NewProofCache(64, 10000),
 		policy:     &fidelity.DefaultPolicy,
 	}
@@ -129,9 +130,11 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 
 	switch cmd {
 	case "PING":
+		telemetry.Get().Pings.Add(1)
 		return "+PONG\r\n", nil
 
 	case "SET":
+		telemetry.Get().Sets.Add(1)
 		if len(args) < 3 {
 			return "", fmt.Errorf("wrong number of arguments for 'set' command")
 		}
@@ -142,21 +145,53 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		expr := &core.EConst{Value: value}
 
 		var causalPast []core.Hash
-		if prev, ok := s.crystal.GetCurrent(path); ok {
+		if prev, ok := s.store.GetCurrent(path); ok {
 			causalPast = []core.Hash{prev.Hash}
 		}
 
-		if _, err := s.crystal.AppendAtom(expr, path, causalPast); err != nil {
+		if _, err := s.store.AppendAtom(expr, path, causalPast); err != nil {
+			telemetry.Get().Errors.Add(1)
 			return "", err
 		}
 
 		return "+OK\r\n", nil
 
 	case "GET":
+		telemetry.Get().Gets.Add(1)
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'get' command")
 		}
 		path := args[1]
+
+		// Support for transparent SQL query caching
+		if strings.HasPrefix(strings.ToUpper(path), "SELECT") {
+			expr, qPath, err := engine.SQLToProofTree(path, s.store)
+			if err == nil {
+				path = qPath
+				// Check if we already have this composed proof
+				h := sha3.New256()
+				h.Write([]byte(path))
+				h.Write([]byte{byte(core.ModeDeductive)})
+				var queryHash core.Hash
+				copy(queryHash[:], h.Sum(nil))
+
+				if proof, ok := s.proofCache.Get(queryHash); ok {
+					val, err := engine.ReduceIncremental(proof, s.store)
+					if err == nil {
+						telemetry.Get().CacheHits.Add(1)
+						return formatValue(val), nil
+					}
+				}
+
+				// If not in cache or stale, reduce the new expr
+				val, cache, err := engine.ReduceProofTree(expr, s.store)
+				if err == nil {
+					telemetry.Get().ProofReductions.Add(1)
+					_ = cache // Future: populate nodeCache in MaterializedProof
+					return formatValue(val), nil
+				}
+			}
+		}
 
 		h := sha3.New256()
 		h.Write([]byte(path))
@@ -164,28 +199,31 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		var queryHash core.Hash
 		copy(queryHash[:], h.Sum(nil))
 
-		current, ok := s.crystal.GetCurrent(path)
+		current, ok := s.store.GetCurrent(path)
 		if !ok {
+			telemetry.Get().CacheMisses.Add(1)
 			return "$-1\r\n", nil
 		}
 		// Return nil for tombstoned keys
-		if current.Expr != nil {
-			if e, ok := current.Expr.(*core.EConst); ok {
-				if _, isNull := e.Value.(core.VNull); isNull {
-					return "$-1\r\n", nil
-				}
-			}
+		if isTombstone(current) {
+			telemetry.Get().CacheMisses.Add(1)
+			return "$-1\r\n", nil
 		}
 
 		if proof, ok := s.proofCache.Get(queryHash); ok {
-			val, err := engine.ReduceIncremental(proof, s.crystal)
+			val, err := engine.ReduceIncremental(proof, s.store)
 			if err == nil {
+				telemetry.Get().CacheHits.Add(1)
+				telemetry.Get().IncrementalHits.Add(1)
 				return formatValue(val), nil
 			}
 		}
 
-		proof, err := engine.ComposeProof(s.crystal, path, core.ModeDeductive)
+		telemetry.Get().CacheMisses.Add(1)
+		telemetry.Get().ProofReductions.Add(1)
+		proof, err := engine.ComposeProof(s.store, path, core.ModeDeductive)
 		if err != nil {
+			telemetry.Get().Errors.Add(1)
 			return "", err
 		}
 		s.proofCache.Set(queryHash, proof)
@@ -193,15 +231,16 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return formatValue(proof.Value), nil
 
 	case "DEL":
+		telemetry.Get().Dels.Add(1)
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'del' command")
 		}
 		deleted := 0
 		for _, path := range args[1:] {
-			if prev, ok := s.crystal.GetCurrent(path); ok {
+			if prev, ok := s.store.GetCurrent(path); ok {
 				expr := &core.EConst{Value: core.VNull{}}
 				causalPast := []core.Hash{prev.Hash}
-				if _, err := s.crystal.AppendAtom(expr, path, causalPast); err == nil {
+				if _, err := s.store.AppendAtom(expr, path, causalPast); err == nil {
 					deleted++
 				}
 			}
@@ -209,12 +248,13 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return fmt.Sprintf(":%d\r\n", deleted), nil
 
 	case "EXISTS":
+		telemetry.Get().Exists.Add(1)
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'exists' command")
 		}
 		count := 0
 		for _, path := range args[1:] {
-			if atom, ok := s.crystal.GetCurrent(path); ok {
+			if atom, ok := s.store.GetCurrent(path); ok {
 				if !isTombstone(atom) {
 					count++
 				}
@@ -223,27 +263,25 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return fmt.Sprintf(":%d\r\n", count), nil
 
 	case "DBSIZE":
+		telemetry.Get().DbSizes.Add(1)
 		count := 0
-		for _, path := range s.crystal.FrontierPaths() {
-			if atom, ok := s.crystal.GetCurrent(path); ok && !isTombstone(atom) {
+		for _, path := range s.store.FrontierPaths() {
+			if atom, ok := s.store.GetCurrent(path); ok && !isTombstone(atom) {
 				count++
 			}
 		}
 		return fmt.Sprintf(":%d\r\n", count), nil
 
 	case "MGET":
+		telemetry.Get().MGets.Add(1)
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'mget' command")
 		}
 		paths := args[1:]
 		resp := fmt.Sprintf("*%d\r\n", len(paths))
 		for _, path := range paths {
-			current, ok := s.crystal.GetCurrent(path)
-			if !ok {
-				resp += "$-1\r\n"
-				continue
-			}
-			if isTombstone(current) {
+			current, ok := s.store.GetCurrent(path)
+			if !ok || isTombstone(current) {
 				resp += "$-1\r\n"
 				continue
 			}
@@ -254,13 +292,14 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 			copy(queryHash[:], h.Sum(nil))
 
 			if proof, ok := s.proofCache.Get(queryHash); ok {
-				val, err := engine.ReduceIncremental(proof, s.crystal)
+				val, err := engine.ReduceIncremental(proof, s.store)
 				if err == nil {
+					telemetry.Get().CacheHits.Add(1)
 					resp += formatValue(val)
 					continue
 				}
 			}
-			proof, err := engine.ComposeProof(s.crystal, path, core.ModeDeductive)
+			proof, err := engine.ComposeProof(s.store, path, core.ModeDeductive)
 			if err != nil {
 				resp += "$-1\r\n"
 				continue
@@ -271,6 +310,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return resp, nil
 
 	case "MSET":
+		telemetry.Get().MSets.Add(1)
 		if len(args) < 3 || len(args[1:])%2 != 0 {
 			return "", fmt.Errorf("wrong number of arguments for 'mset' command")
 		}
@@ -281,16 +321,18 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 			value := core.VString(val)
 			expr := &core.EConst{Value: value}
 			var causalPast []core.Hash
-			if prev, ok := s.crystal.GetCurrent(path); ok {
+			if prev, ok := s.store.GetCurrent(path); ok {
 				causalPast = []core.Hash{prev.Hash}
 			}
-			if _, err := s.crystal.AppendAtom(expr, path, causalPast); err != nil {
+			if _, err := s.store.AppendAtom(expr, path, causalPast); err != nil {
+				telemetry.Get().Errors.Add(1)
 				return "", err
 			}
 		}
 		return "+OK\r\n", nil
 
 	case "HSET":
+		telemetry.Get().HSets.Add(1)
 		if len(args) < 4 {
 			return "", fmt.Errorf("wrong number of arguments for 'hset' command")
 		}
@@ -301,26 +343,25 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		value := core.VString(val)
 		expr := &core.EConst{Value: value}
 		var causalPast []core.Hash
-		if prev, ok := s.crystal.GetCurrent(hashPath); ok {
+		if prev, ok := s.store.GetCurrent(hashPath); ok {
 			causalPast = []core.Hash{prev.Hash}
 		}
-		if _, err := s.crystal.AppendAtom(expr, hashPath, causalPast); err != nil {
+		if _, err := s.store.AppendAtom(expr, hashPath, causalPast); err != nil {
+			telemetry.Get().Errors.Add(1)
 			return "", err
 		}
 		return ":1\r\n", nil
 
 	case "HGET":
+		telemetry.Get().HGets.Add(1)
 		if len(args) < 3 {
 			return "", fmt.Errorf("wrong number of arguments for 'hget' command")
 		}
 		key := args[1]
 		field := args[2]
 		hashPath := key + ":" + field
-		current, ok := s.crystal.GetCurrent(hashPath)
-		if !ok {
-			return "$-1\r\n", nil
-		}
-		if isTombstone(current) {
+		current, ok := s.store.GetCurrent(hashPath)
+		if !ok || isTombstone(current) {
 			return "$-1\r\n", nil
 		}
 		h := sha3.New256()
@@ -330,12 +371,13 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		copy(queryHash[:], h.Sum(nil))
 
 		if proof, ok := s.proofCache.Get(queryHash); ok {
-			val, err := engine.ReduceIncremental(proof, s.crystal)
+			val, err := engine.ReduceIncremental(proof, s.store)
 			if err == nil {
+				telemetry.Get().CacheHits.Add(1)
 				return formatValue(val), nil
 			}
 		}
-		proof, err := engine.ComposeProof(s.crystal, hashPath, core.ModeDeductive)
+		proof, err := engine.ComposeProof(s.store, hashPath, core.ModeDeductive)
 		if err != nil {
 			return "$-1\r\n", nil
 		}
@@ -343,15 +385,16 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return formatValue(proof.Value), nil
 
 	case "HGETALL":
+		telemetry.Get().HGetAlls.Add(1)
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'hgetall' command")
 		}
 		key := args[1]
 		prefix := key + ":"
 		var fields []string
-		for _, path := range s.crystal.FrontierPaths() {
+		for _, path := range s.store.FrontierPaths() {
 			if strings.HasPrefix(path, prefix) {
-				if atom, ok := s.crystal.GetCurrent(path); ok && !isTombstone(atom) {
+				if atom, ok := s.store.GetCurrent(path); ok && !isTombstone(atom) {
 					fieldName := path[len(prefix):]
 					fields = append(fields, fieldName)
 				}
@@ -369,13 +412,14 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 
 			var valStr string
 			if proof, ok := s.proofCache.Get(queryHash); ok {
-				val, err := engine.ReduceIncremental(proof, s.crystal)
+				val, err := engine.ReduceIncremental(proof, s.store)
 				if err == nil {
+					telemetry.Get().CacheHits.Add(1)
 					valStr = formatValue(val)
 				}
 			}
 			if valStr == "" {
-				proof, err := engine.ComposeProof(s.crystal, hashPath, core.ModeDeductive)
+				proof, err := engine.ComposeProof(s.store, hashPath, core.ModeDeductive)
 				if err == nil {
 					s.proofCache.Set(queryHash, proof)
 					valStr = formatValue(proof.Value)
@@ -391,6 +435,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return resp, nil
 
 	case "EXPIRE":
+		telemetry.Get().Expires.Add(1)
 		if len(args) < 3 {
 			return "", fmt.Errorf("wrong number of arguments for 'expire' command")
 		}
@@ -402,28 +447,22 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		if seconds <= 0 {
 			return ":0\r\n", nil
 		}
-		current, ok := s.crystal.GetCurrent(path)
+		current, ok := s.store.GetCurrent(path)
 		if !ok || isTombstone(current) {
 			return ":0\r\n", nil
 		}
-		// Append a new atom with the same value but mark for expiry
-		// In production, TTL is handled by the DB adapter
-		// In dev mode, we re-append the atom and the sweeper checks timestamps
-		_ = seconds // Future: store in frontier expiresAt
+		// Phase 1: TTL is handled by the primary DB
 		return ":1\r\n", nil
 
 	case "TTL":
+		telemetry.Get().TTLs.Add(1)
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'ttl' command")
 		}
-		current, ok := s.crystal.GetCurrent(args[1])
-		if !ok {
+		current, ok := s.store.GetCurrent(args[1])
+		if !ok || isTombstone(current) {
 			return ":-2\r\n", nil
 		}
-		if isTombstone(current) {
-			return ":-2\r\n", nil
-		}
-		// Dev mode: no TTL tracking yet, return -1 (no expiry)
 		return ":-1\r\n", nil
 
 	default:
@@ -431,8 +470,6 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 	}
 }
 
-// formatValue converts a Wavicle Value to a RESP3 bulk string.
-// If the value is a VRecord with a single entry, it extracts the inner value.
 func formatValue(v core.Value) string {
 	if rec, ok := v.(core.VRecord); ok && len(rec) == 1 {
 		for _, val := range rec {
