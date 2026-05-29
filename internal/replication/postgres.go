@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -85,6 +86,7 @@ func (l *PGListener) run(ctx context.Context) {
 
 		if err := l.connectAndConsume(ctx); err != nil {
 			l.running.Store(false)
+			log.Printf("[replication] PostgreSQL connection error: %v. Retrying in %v...", err, backoff)
 			select {
 			case <-ctx.Done():
 				return
@@ -233,7 +235,7 @@ func (l *PGListener) processXLogData(ctx context.Context, conn *pgconn.PgConn, d
 		l.relations[msg.RelationID] = msg
 
 	case *pglogrepl.InsertMessage:
-		evt := l.buildInsertEvent(msg)
+		evt := l.buildInsertEvent(msg, xld.ServerTime)
 		if evt != nil {
 			select {
 			case l.events <- *evt:
@@ -243,7 +245,7 @@ func (l *PGListener) processXLogData(ctx context.Context, conn *pgconn.PgConn, d
 		}
 
 	case *pglogrepl.UpdateMessage:
-		evt := l.buildUpdateEvent(msg)
+		evt := l.buildUpdateEvent(msg, xld.ServerTime)
 		if evt != nil {
 			select {
 			case l.events <- *evt:
@@ -253,7 +255,7 @@ func (l *PGListener) processXLogData(ctx context.Context, conn *pgconn.PgConn, d
 		}
 
 	case *pglogrepl.DeleteMessage:
-		evt := l.buildDeleteEvent(msg)
+		evt := l.buildDeleteEvent(msg, xld.ServerTime)
 		if evt != nil {
 			select {
 			case l.events <- *evt:
@@ -267,7 +269,7 @@ func (l *PGListener) processXLogData(ctx context.Context, conn *pgconn.PgConn, d
 }
 
 // buildInsertEvent converts an InsertMessage to a ChangeEvent.
-func (l *PGListener) buildInsertEvent(msg *pglogrepl.InsertMessage) *ChangeEvent {
+func (l *PGListener) buildInsertEvent(msg *pglogrepl.InsertMessage, commitTime time.Time) *ChangeEvent {
 	rel, ok := l.relations[msg.RelationID]
 	if !ok {
 		return nil
@@ -279,11 +281,12 @@ func (l *PGListener) buildInsertEvent(msg *pglogrepl.InsertMessage) *ChangeEvent
 		Action:        "INSERT",
 		NewValues:     cols,
 		AffectedPaths: paths,
+		CommitTime:    commitTime,
 	}
 }
 
 // buildUpdateEvent converts an UpdateMessage to a ChangeEvent.
-func (l *PGListener) buildUpdateEvent(msg *pglogrepl.UpdateMessage) *ChangeEvent {
+func (l *PGListener) buildUpdateEvent(msg *pglogrepl.UpdateMessage, commitTime time.Time) *ChangeEvent {
 	rel, ok := l.relations[msg.RelationID]
 	if !ok {
 		return nil
@@ -309,11 +312,12 @@ func (l *PGListener) buildUpdateEvent(msg *pglogrepl.UpdateMessage) *ChangeEvent
 		OldValues:     oldCols,
 		NewValues:     newCols,
 		AffectedPaths: paths,
+		CommitTime:    commitTime,
 	}
 }
 
 // buildDeleteEvent converts a DeleteMessage to a ChangeEvent.
-func (l *PGListener) buildDeleteEvent(msg *pglogrepl.DeleteMessage) *ChangeEvent {
+func (l *PGListener) buildDeleteEvent(msg *pglogrepl.DeleteMessage, commitTime time.Time) *ChangeEvent {
 	rel, ok := l.relations[msg.RelationID]
 	if !ok {
 		return nil
@@ -328,6 +332,7 @@ func (l *PGListener) buildDeleteEvent(msg *pglogrepl.DeleteMessage) *ChangeEvent
 		Action:        "DELETE",
 		OldValues:     oldCols,
 		AffectedPaths: paths,
+		CommitTime:    commitTime,
 	}
 }
 
