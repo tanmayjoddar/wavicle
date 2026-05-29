@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/status-phase1_complete-22c55e?style=flat-square" alt="Status"/>
-  <img src="https://img.shields.io/badge/incremental-47x-22c55e?style=flat-square" alt="47x"/>
-  <img src="https://img.shields.io/badge/vs_redis-1206x_faster-22c55e?style=flat-square" alt="1206x"/>
-  <img src="https://img.shields.io/badge/replication_lag-67ms-22c55e?style=flat-square" alt="67ms"/>
-  <img src="https://img.shields.io/badge/cache_hit_rate-97%25-22c55e?style=flat-square" alt="97%"/>
+  <img src="https://img.shields.io/badge/status-phase1_complete-success?style=for-the-badge" alt="Status"/>
+  <img src="https://img.shields.io/badge/vs_redis-1206x_faster-success?style=for-the-badge" alt="1206x"/>
+  <img src="https://img.shields.io/badge/replication_lag-67ms-success?style=for-the-badge" alt="67ms"/>
+  <img src="https://img.shields.io/badge/cache_hit_rate-97%25-success?style=for-the-badge" alt="97%"/>
+  <img src="https://img.shields.io/badge/stale_reads-0%25-success?style=for-the-badge" alt="0%"/>
 </p>
 
 <br/>
