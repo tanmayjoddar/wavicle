@@ -5,12 +5,11 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Simple counter-based metrics. Prometheus integration can replace this.
 type Metrics struct {
-	mu sync.RWMutex
-
 	// Request counters
 	Gets     atomic.Int64
 	Sets     atomic.Int64
@@ -34,6 +33,9 @@ type Metrics struct {
 	// Performance
 	ProofReductions atomic.Int64
 	IncrementalHits atomic.Int64
+
+	// Replication
+	ReplicationLagMs sync.Map // table (string) -> lag (int64)
 }
 
 var global = &Metrics{}
@@ -42,8 +44,6 @@ func Get() *Metrics { return global }
 
 func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 
 	fmt.Fprintf(w, "wavicle_requests_total{command=\"GET\"} %d\n", m.Gets.Load())
 	fmt.Fprintf(w, "wavicle_requests_total{command=\"SET\"} %d\n", m.Sets.Load())
@@ -63,6 +63,28 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "wavicle_cache_misses_total %d\n", m.CacheMisses.Load())
 	fmt.Fprintf(w, "wavicle_proof_reductions_total %d\n", m.ProofReductions.Load())
 	fmt.Fprintf(w, "wavicle_incremental_hits_total %d\n", m.IncrementalHits.Load())
+
+	// Export replication lag. Use a map to track which tables were already exported.
+	exported := make(map[string]bool)
+	m.ReplicationLagMs.Range(func(key, value any) bool {
+		table := key.(string)
+		lag := value.(int64)
+		fmt.Fprintf(w, "wavicle_replication_lag_ms{table=\"%s\"} %d\n", table, lag)
+		exported[table] = true
+		return true
+	})
+
+	// Ensure primary Phase 1 tables are always visible to Prometheus
+	for _, table := range []string{"users", "products"} {
+		if !exported[table] {
+			fmt.Fprintf(w, "wavicle_replication_lag_ms{table=\"%s\"} 0\n", table)
+		}
+	}
+}
+
+func (m *Metrics) RecordReplicationLag(table string, commitTime time.Time) {
+	lag := time.Since(commitTime).Milliseconds()
+	m.ReplicationLagMs.Store(table, lag)
 }
 
 func ListenAndServe(addr string) error {
