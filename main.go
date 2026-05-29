@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 	"wavicle/internal/config"
 	"wavicle/internal/core"
 	"wavicle/internal/protocol/resp3"
@@ -61,10 +62,12 @@ func main() {
 		if err != nil {
 			log.Printf("Warning: Failed to start PG replication: %v", err)
 		} else {
+			log.Printf("Replication listener started, waiting for events...")
 			go func() {
 				for evt := range events {
+					telemetry.Get().RecordReplicationLag(evt.Table, evt.CommitTime)
 					for _, path := range evt.AffectedPaths {
-						log.Printf("DB Change [%s]: path %s", evt.Action, path)
+						log.Printf("DB Change [%s]: path %s (lag: %v)", evt.Action, path, time.Since(evt.CommitTime))
 						
 						if evt.Action == "DELETE" {
 							crystal.AppendAtom(&core.EConst{Value: core.VNull{}}, path, nil)
