@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // ChangeEvent represents a data change detected by a database listener.
@@ -12,6 +13,7 @@ type ChangeEvent struct {
 	OldValues    map[string]any // previous row values (UPDATE, DELETE)
 	NewValues    map[string]any // new row values (INSERT, UPDATE)
 	AffectedPaths []string      // cache paths that depend on this change
+	CommitTime    time.Time     // When the change was committed to the DB
 }
 
 // ChangeListener is implemented by each database adapter.
