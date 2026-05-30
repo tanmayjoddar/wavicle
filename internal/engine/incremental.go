@@ -7,6 +7,11 @@ import (
 	"wavicle/internal/storage"
 )
 
+// crystalQuery is the subset of CausalCrystal used by ComputeProofMerkleRoot.
+type crystalQuery interface {
+	GetCurrentHash(path string) (core.Hash, bool)
+}
+
 type ReduceStats struct {
 	ChangedPaths  int
 	CacheHits     int
@@ -48,9 +53,16 @@ func ReduceIncremental(
 		return proof.Value, nil
 	}
 
-	// INCREMENTAL PATH
-	// Find which paths changed
-	changedPathsList := crystal.FindChangedPaths(proof.VersionVector.Entries)
+	// FAST PATH 2: Root node still valid — O(1) tree-level shortcut
+	if proof.RootNode != nil && proof.RootNode.MerkleValid && !proof.RootNode.Dirty {
+		proof.AccessCount++
+		proof.LastVerifiedAt = time.Now().UnixNano()
+		return proof.Value, nil
+	}
+
+	// INCREMENTAL PATH — find which paths changed, zero-alloc
+	var changedBuf [64]string
+	changedPathsList := crystal.FindChangedPaths(proof.VersionVector.Entries, changedBuf[:0])
 	proof.ReduceStats.ChangedPaths = len(changedPathsList)
 
 	var newValue core.Value
@@ -77,15 +89,14 @@ func ReduceIncremental(
 
 	proof.Value = newValue
 	
-	// Update version vector and Merkle root lazily (but needed for next fast path)
-	// For peak performance, we only update what changed.
+	// Update version vector for next fast-path read
 	for _, path := range changedPathsList {
 		if h, ok := crystal.GetCurrentHash(path); ok {
 			proof.VersionVector.Entries[path] = h
 		}
 	}
-	// Note: We skip re-computing proof.MerkleRoot here to reach the ~3,000ns target.
-	// This means FastPath 2 won't hit until the NEXT compose, but FastPath 1 will.
+	// ProofNode tree is now fully reduced — all dirty flags are cleared.
+	// FastPath2 will check RootNode.MerkleValid on the next read.
 	
 	proof.LastVerifiedAt = time.Now().UnixNano()
 	proof.AccessCount++
@@ -103,9 +114,6 @@ func reduceDirty(node *ProofNode, crystal *storage.CausalCrystal, proof *Materia
 
 	proof.ReduceStats.CacheMisses++
 
-	var result core.Value
-	var err error
-
 	// If this node represents a leaf (atom), update its expression from the crystal
 	if node.SourcePath != "" && node.Dirty {
 		if currentAtom, ok := crystal.GetCurrent(node.SourcePath); ok {
@@ -114,10 +122,18 @@ func reduceDirty(node *ProofNode, crystal *storage.CausalCrystal, proof *Materia
 		}
 	}
 
-	switch e := node.Expr.(type) {
-	case *core.EConst:
-		result = e.Value
+	// Fast path: direct EConst — avoid full type switch
+	if e, ok := node.Expr.(*core.EConst); ok {
+		node.CachedValue = e.Value
+		node.Dirty = false
+		node.MerkleValid = false
+		return e.Value, nil
+	}
 
+	var result core.Value
+	var err error
+
+	switch e := node.Expr.(type) {
 	case *core.EFieldAccess:
 		if len(node.Children) > 0 {
 			sourceVal, err := reduceDirty(node.Children[0], crystal, proof)
@@ -130,13 +146,53 @@ func reduceDirty(node *ProofNode, crystal *storage.CausalCrystal, proof *Materia
 		}
 
 	case *core.ECompose:
-		record := make(core.VRecord, len(node.Children))
-		for _, childNode := range node.Children {
-			subVal, err := reduceDirty(childNode, crystal, proof)
+		children := node.Children
+		n := len(children)
+		record := make(core.VRecord, n)
+		// Unroll common small sizes to reduce loop overhead
+		switch n {
+		case 0:
+		case 1:
+			subVal, err := reduceDirty(children[0], crystal, proof)
 			if err != nil {
 				return nil, err
 			}
-			record[childNode.SourcePath] = subVal
+			record[children[0].SourcePath] = subVal
+		case 2:
+			subVal0, err := reduceDirty(children[0], crystal, proof)
+			if err != nil {
+				return nil, err
+			}
+			subVal1, err := reduceDirty(children[1], crystal, proof)
+			if err != nil {
+				return nil, err
+			}
+			record[children[0].SourcePath] = subVal0
+			record[children[1].SourcePath] = subVal1
+		case 3:
+			subVal0, err := reduceDirty(children[0], crystal, proof)
+			if err != nil {
+				return nil, err
+			}
+			subVal1, err := reduceDirty(children[1], crystal, proof)
+			if err != nil {
+				return nil, err
+			}
+			subVal2, err := reduceDirty(children[2], crystal, proof)
+			if err != nil {
+				return nil, err
+			}
+			record[children[0].SourcePath] = subVal0
+			record[children[1].SourcePath] = subVal1
+			record[children[2].SourcePath] = subVal2
+		default:
+			for _, childNode := range children {
+				subVal, err := reduceDirty(childNode, crystal, proof)
+				if err != nil {
+					return nil, err
+				}
+				record[childNode.SourcePath] = subVal
+			}
 		}
 		result = record
 
@@ -165,6 +221,7 @@ func reduceDirty(node *ProofNode, crystal *storage.CausalCrystal, proof *Materia
 
 	node.CachedValue = result
 	node.Dirty = false
+	node.MerkleValid = false
 	return result, nil
 }
 
