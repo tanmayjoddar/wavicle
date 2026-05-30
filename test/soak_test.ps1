@@ -14,41 +14,78 @@ $totalOps = 0
 
 $watch = [System.Diagnostics.Stopwatch]::StartNew()
 
-try {
-    while ($true) {
-        $tcp = New-Object System.Net.Sockets.TcpClient("localhost", 6379)
-        $stream = $tcp.GetStream()
-        $writer = New-Object System.IO.StreamWriter($stream)
-        $reader = New-Object System.IO.StreamReader($stream)
-
-        # Authenticate
-        $writer.WriteLine("AUTH $authPassword")
-        $writer.Flush()
-        $authResp = $reader.ReadLine()
-
-        if ($authResp -eq "+OK") {
-            # Generate random operations
-            for ($i = 0; $i -lt 100; $i++) {
-                $id = Get-Random -Minimum 1 -Maximum 1000
-                $val = Get-Random -Minimum 1000 -Maximum 9999
-                
-                # Write
-                $writer.WriteLine("SET users:$id:name SoakTest$val")
-                $writer.Flush()
-                $setResp = $reader.ReadLine()
-                if ($setResp -ne "+OK") { $writeErrors++ }
-
-                # Read
-                $writer.WriteLine("GET users:$id:name")
-                $writer.Flush()
-                $reader.ReadLine() | Out-Null # bulk length
-                $getResp = $reader.ReadLine()
-                if ($getResp -ne "SoakTest$val") { $readErrors++ }
-
-                $totalOps += 2
-            }
+# Robust RESP3 parser to avoid desyncs on errors
+function Read-Resp($reader) {
+    $line = $reader.ReadLine()
+    if ($null -eq $line) { return $null }
+    
+    $type = $line[0]
+    if ($type -eq '+' -or $type -eq '-' -or $type -eq ':') {
+        return $line
+    } elseif ($type -eq '$') {
+        $len = [int]$line.Substring(1)
+        if ($len -eq -1) { return "$-1" }
+        $data = $reader.ReadLine()
+        return $data
+    } elseif ($type -eq '*') {
+        $count = [int]$line.Substring(1)
+        $arr = @()
+        for ($i = 0; $i -lt $count; $i++) {
+            $arr += Read-Resp $reader
         }
-        $tcp.Close()
+        return $arr
+    }
+    return $line
+}
+
+try {
+    # Open persistent connection
+    $tcp = New-Object System.Net.Sockets.TcpClient("localhost", 6379)
+    $stream = $tcp.GetStream()
+    $writer = New-Object System.IO.StreamWriter($stream)
+    $reader = New-Object System.IO.StreamReader($stream)
+
+    # Authenticate
+    $writer.WriteLine("AUTH $authPassword")
+    $writer.Flush()
+    $authResp = Read-Resp $reader
+
+    if ($authResp -ne "+OK") {
+        Write-Host "Authentication failed: $authResp" -ForegroundColor Red
+        exit 1
+    }
+
+    while ($true) {
+        if (-not $tcp.Connected) {
+            Write-Host "Connection lost. Reconnecting..." -ForegroundColor Yellow
+            $tcp = New-Object System.Net.Sockets.TcpClient("localhost", 6379)
+            $stream = $tcp.GetStream()
+            $writer = New-Object System.IO.StreamWriter($stream)
+            $reader = New-Object System.IO.StreamReader($stream)
+            $writer.WriteLine("AUTH $authPassword")
+            $writer.Flush()
+            Read-Resp $reader | Out-Null
+        }
+
+        # Generate random operations
+        for ($i = 0; $i -lt 100; $i++) {
+            $id = Get-Random -Minimum 1 -Maximum 1000
+            $val = Get-Random -Minimum 1000 -Maximum 9999
+            
+            # Write
+            $writer.WriteLine("SET users:$id:name SoakTest$val")
+            $writer.Flush()
+            $setResp = Read-Resp $reader
+            if ($setResp -ne "+OK") { $writeErrors++ }
+
+            # Read
+            $writer.WriteLine("GET users:$id:name")
+            $writer.Flush()
+            $getResp = Read-Resp $reader
+            if ($getResp -ne "SoakTest$val") { $readErrors++ }
+
+            $totalOps += 2
+        }
 
         # Print status every ~5 seconds
         if ($watch.ElapsedMilliseconds -gt 5000) {
@@ -58,10 +95,12 @@ try {
             try {
                 $metrics = (Invoke-WebRequest -Uri "http://localhost:8080/metrics" -UseBasicParsing).Content
                 $walSize = [math]::Round([int](($metrics | Select-String "wavicle_wal_size_bytes") -split ' ')[1] / 1MB, 2)
-                $activeConns = ($metrics | Select-String "wavicle_active_connections") -split ' ' | Select-Object -Last 1
                 $compactions = ($metrics | Select-String "wavicle_compactions_total") -split ' ' | Select-Object -Last 1
                 
-                Write-Host "[Status] QPS: $qps | Active Conns: $activeConns | WAL Size: ${walSize}MB | Compactions: $compactions | Read Errs: $readErrors | Write Errs: $writeErrors"
+                # Track memory footprint 
+                $wavicleMemory = (docker stats wavicle-wavicle-1 --no-stream --format "{{.MemUsage}}").Trim()
+                
+                Write-Host "[Status] QPS: $qps | Mem: $wavicleMemory | WAL: ${walSize}MB | Comps: $compactions | R_Err: $readErrors | W_Err: $writeErrors"
             } catch {
                 Write-Host "[Status] QPS: $qps | Failed to fetch metrics" -ForegroundColor Red
             }
@@ -70,10 +109,10 @@ try {
             $totalOps = 0
         }
         
-        # Sleep slightly to avoid completely overwhelming the local Docker network 
-        # (in production, this would be distributed load)
+        # Slight throttle
         Start-Sleep -Milliseconds 10 
     }
 } finally {
+    if ($tcp -ne $null) { $tcp.Close() }
     Write-Host "`nSoak test terminated." -ForegroundColor Cyan
 }
