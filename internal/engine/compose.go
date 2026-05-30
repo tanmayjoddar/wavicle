@@ -2,7 +2,6 @@ package engine
 
 import (
 	"fmt"
-	"time"
 	"wavicle/internal/core"
 	"wavicle/internal/storage"
 )
@@ -13,40 +12,59 @@ func ComposeProof(store storage.Store, path string, mode core.ObservationMode) (
 		return nil, fmt.Errorf("causal closure: %w", err)
 	}
 
+	pathToNode := make(map[string]*ProofNode)
+	rootNode := buildProofNode(store, path, nil, pathToNode)
+
+	// Keep the legacy ProofTree for backward compatibility
 	proofTree := buildProofTree(store, relevantAtoms, path)
 
-	value, nodeCache, err := ReduceProofTree(proofTree, store)
-	if err != nil {
-		return nil, fmt.Errorf("reduce proof tree: %w", err)
+	proof := &MaterializedProof{
+		QueryPath:     path,
+		Mode:          mode,
+		ProofTree:     proofTree,
+		RootNode:      rootNode,
+		PathToNode:    pathToNode,
+		VersionVector: captureVersionVector(store, relevantAtoms),
 	}
 
-	vv := captureVersionVector(store, relevantAtoms)
-	var merkleRoot core.Hash
 	if crystal, ok := store.(*storage.CausalCrystal); ok {
-		merkleRoot = ComputeVersionMerkleRoot(vv, crystal)
+		proof.MerkleRoot = ComputeVersionMerkleRoot(proof.VersionVector, crystal)
+		// Perform a cold reduction on the RootNode to populate its CachedValue fields
+		val, _ := reduceDirty(proof.RootNode, crystal, proof)
+		proof.Value = val
+		proof.ValueHash = core.HashValue(val)
 	}
 
-	pathToExpr := make(map[string]core.Hash)
-	for _, a := range relevantAtoms {
-		pathToExpr[a.Path] = a.Expr.ExprHash()
+	return proof, nil
+}
+
+func buildProofNode(store storage.Store, path string, parent *ProofNode, pathIndex map[string]*ProofNode) *ProofNode {
+	atom, ok := store.GetCurrent(path)
+	if !ok {
+		return nil
 	}
 
-	now := time.Now().UnixNano()
-	return &MaterializedProof{
-		QueryPath:      path,
-		Mode:           mode,
-		Value:          value,
-		ValueHash:      core.HashValue(value),
-		VersionVector:  vv,
-		MerkleRoot:     merkleRoot,
-		NodeCache:      nodeCache,
-		PathToExpr:     pathToExpr,
-		ProofTree:      proofTree,
-		CreatedAt:      now,
-		LastVerifiedAt: now,
-		AccessCount:    1,
-		Confidence:     1.0,
-	}, nil
+	node := &ProofNode{
+		Expr:       atom.Expr,
+		SourceHash: atom.Hash,
+		SourcePath: path,
+		Parent:     parent,
+	}
+	pathIndex[path] = node
+
+	// Recursive construction based on expression type
+	switch e := atom.Expr.(type) {
+	case *core.ECompose:
+		node.Children = make([]*ProofNode, len(e.Atoms))
+		for i, h := range e.Atoms {
+			// Find the path for this atom hash
+			if childAtom, ok := store.GetAtom(h); ok {
+				node.Children[i] = buildProofNode(store, childAtom.Path, node, pathIndex)
+			}
+		}
+	}
+
+	return node
 }
 
 func gatherCausalClosure(crystal storage.Store, path string) ([]*core.CausalAtom, error) {
@@ -93,7 +111,7 @@ func buildProofTree(crystal storage.Store, atoms []*core.CausalAtom, primaryPath
 			hashes = append(hashes, a.Hash)
 		}
 	}
-	return &core.ECompose{Atoms: hashes}
+	return core.NewECompose(hashes)
 }
 
 func ReduceProofTree(expr core.CombinatorExpr, crystal storage.Store) (core.Value, map[core.Hash]core.Value, error) {

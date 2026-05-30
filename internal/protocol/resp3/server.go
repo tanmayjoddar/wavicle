@@ -224,7 +224,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		val := args[2]
 
 		value := core.VString(val)
-		expr := &core.EConst{Value: value}
+		expr := core.NewEConst(value)
 
 		var causalPast []core.Hash
 		if prev, ok := s.store.GetCurrent(path); ok {

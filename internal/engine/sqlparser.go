@@ -60,6 +60,6 @@ func SQLToProofTree(query string, store storage.Store) (core.CombinatorExpr, str
 		return nil, "", fmt.Errorf("no data found for query dependencies")
 	}
 
-	expr := &core.ECompose{Atoms: atomHashes}
+	expr := core.NewECompose(atomHashes)
 	return expr, primaryPath, nil
 }

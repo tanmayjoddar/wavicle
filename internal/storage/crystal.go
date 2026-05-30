@@ -96,6 +96,14 @@ func (c *CausalCrystal) Recover() error {
 }
 
 func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causalPast []core.Hash, expiresAt time.Time) (core.Hash, error) {
+	// Ensure expr is interned to support Tier 1/2 hashing
+	if expr.GetHeader() == nil || expr.GetHeader().ID == 0 {
+		// If it's a raw struct, we need to intern it. 
+		// Note: Most callers should use NewEConst/NewECompose.
+		// For safety, we intern here.
+		expr = core.InternExpr(expr)
+	}
+
 	// Step 1: Determine causal depth
 	depth := uint64(0)
 	for _, parentHash := range causalPast {

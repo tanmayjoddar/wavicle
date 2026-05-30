@@ -22,6 +22,54 @@ func (vv *VersionVector) PathList() []string {
 	return paths
 }
 
+// ProofNode wraps a CombinatorExpr to cache its value and track its dirty state.
+type ProofNode struct {
+	Expr        core.CombinatorExpr
+	Children    []*ProofNode
+	Parent      *ProofNode // Support upward propagation
+	CachedValue core.Value
+	Dirty       bool
+
+	// Metadata to map crystal updates back to this node
+	SourceHash core.Hash
+	SourcePath string
+}
+
+// PropagateDirtyUp marks this node as dirty and recursively marks its ancestors.
+func (n *ProofNode) PropagateDirtyUp() {
+	if n.Dirty {
+		return // Already propagating from this branch
+	}
+	n.Dirty = true
+	if n.Parent != nil {
+		n.Parent.PropagateDirtyUp()
+	}
+}
+
+// MarkDirty recursively marks a node and its parents as dirty if its source hash/path matches the changed set.
+// This is O(n) and should only be used as a fallback.
+func (n *ProofNode) MarkDirty(changedPaths map[string]bool) {
+	if n.SourcePath != "" && changedPaths[n.SourcePath] {
+		n.Dirty = true
+		return
+	}
+
+	for _, c := range n.Children {
+		c.MarkDirty(changedPaths)
+		if c.Dirty {
+			n.Dirty = true
+		}
+	}
+}
+
+// ResetDirty clears the dirty flags for the next reduction cycle.
+func (n *ProofNode) ResetDirty() {
+	n.Dirty = false
+	for _, c := range n.Children {
+		c.ResetDirty()
+	}
+}
+
 // MaterializedProof is what lives in the Proof Cache.
 type MaterializedProof struct {
 	// Query identity
@@ -33,16 +81,22 @@ type MaterializedProof struct {
 	Value     core.Value
 	ValueHash core.Hash
 
-	// STALENESS TRACKING
+	// The proofs of causality
 	VersionVector *VersionVector
-	MerkleRoot    core.Hash // Merkle root of all dependency atoms
+	MerkleRoot    core.Hash
 
-	// INCREMENTAL REDUCTION STATE
-	NodeCache  map[core.Hash]core.Value // expr_hash -> reduced_value
-	PathToExpr map[string]core.Hash     // path -> expr_hash
+	// Legacy cache (to be deprecated by RootNode)
+	NodeCache  map[core.Hash]core.Value
+	PathToExpr map[string]core.Hash
+
+	// Index for O(k log d) dirty propagation
+	PathToNode map[string]*ProofNode
 
 	// Proof tree: the program that generated the value
 	ProofTree core.CombinatorExpr
+
+	// RootNode: The new zero-hash lazy evaluation tree
+	RootNode *ProofNode
 
 	// Diagnostics
 	ReduceStats ReduceStats
@@ -55,3 +109,4 @@ type MaterializedProof struct {
 
 	mu sync.RWMutex
 }
+
