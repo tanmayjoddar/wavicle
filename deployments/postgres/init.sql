@@ -26,6 +26,13 @@ CREATE TABLE products (
 );
 ALTER TABLE products REPLICA IDENTITY FULL;
 
+CREATE TABLE profile (
+    id TEXT PRIMARY KEY,
+    theme TEXT,
+    lang TEXT
+);
+ALTER TABLE profile REPLICA IDENTITY FULL;
+
 -- 5. Seed some data
 INSERT INTO users (id, name, email) VALUES ('123', 'Alice', 'alice@example.com');
 INSERT INTO products (id, name, price_cents, stock_count) VALUES ('p1', 'Wavicle Token', 100, 1000);

@@ -309,7 +309,7 @@ Three tests prove zero stale reads under mutation. All pass.
 |-------|-------|-------------|----------|
 | **0 — Proof of Concept** | Core algorithm validated | 6 commands, Causal Crystal, 48x benchmarks, zero stale reads | ✅ **Done** |
 | **1 — DB Integration** | Attach to existing databases | PG logical replication, SQL→proof mapping, Docker, 97% hit rate, 67ms lag, 1206x faster than Redis | ✅ **Done** |
-| **2 — Production Ready** | Ship to design partners | Metrics, auth, config, graceful shutdown, 7-day soak test | **H1 2027** |
+| **2 — Production Ready** | Ship to design partners | Metrics, auth, config, graceful shutdown, 7-day soak test | ✅ **Done** |
 | **3 — Enterprise** | Scale and sell | MySQL binlog, RBAC, SSO, audit, cloud marketplace | **H2 2027** |
 
 **The Causal Crystal** is the built-in development storage — it was used to validate the algorithm during Phase 0. In production deployment, Wavicle connects to your existing database. The Causal Crystal remains available for development, testing, and single-node embedded use cases.

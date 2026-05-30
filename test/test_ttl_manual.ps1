@@ -1,0 +1,20 @@
+$tcp = New-Object System.Net.Sockets.TcpClient("localhost", 6379)
+$stream = $tcp.GetStream()
+$writer = New-Object System.IO.StreamWriter($stream)
+$reader = New-Object System.IO.StreamReader($stream)
+$writer.WriteLine("AUTH testpass")
+$writer.Flush()
+Write-Host "AUTH: " $reader.ReadLine()
+
+$writer.WriteLine("SET users:temp:name TTLValue")
+$writer.Flush()
+Write-Host "SET: " $reader.ReadLine()
+
+$writer.WriteLine("EXPIRE users:temp:name 3")
+$writer.Flush()
+Write-Host "EXPIRE: " $reader.ReadLine()
+
+$writer.WriteLine("TTL users:temp:name")
+$writer.Flush()
+Write-Host "TTL: " $reader.ReadLine()
+$tcp.Close()
