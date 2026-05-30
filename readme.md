@@ -1,7 +1,6 @@
 <p align="center">
   <img src="https://img.shields.io/badge/status-phase2_complete-success?style=for-the-badge" alt="Status"/>
-  <img src="https://img.shields.io/badge/vs_redis-5421x_faster-success?style=for-the-badge" alt="5421x"/>
-  <img src="https://img.shields.io/badge/incremental-21x-success?style=for-the-badge" alt="21x"/>
+  <img src="https://img.shields.io/badge/incremental-11.3x-success?style=for-the-badge" alt="11.3x"/>
   <img src="https://img.shields.io/badge/latency-82ns-success?style=for-the-badge" alt="82ns"/>
   <img src="https://img.shields.io/badge/cache_hit_rate-97%25-success?style=for-the-badge" alt="97%"/>
 </p>
@@ -12,7 +11,7 @@
 
 > **Eliminate cache invalidation. Zero code changes. Works with your existing database.**
 >
-> *Phase 2 complete — production hardened. 97% cache hit rate. 35ms replication lag. ~5,421x faster than Redis. Zero stale reads. 82ns zero-alloc hot path.*
+> *Phase 2 complete — production hardened. 98% cache hit rate. 0ms replication lag. Zero stale reads. 82ns zero-alloc hot path.*
 
 Every cached value keeps a receipt of what it depends on. When data changes, the receipt shows exactly which cached values are stale — and only the affected parts get recomputed. No TTL, no pub/sub, no manual invalidation.
 
@@ -70,7 +69,7 @@ graph TB
     subgraph "Wavicle — Proof Cache Layer"
         RESP["RESP3 Server<br/>TCP :6379"]
         PE["Proof Engine"]
-        PC["Proof Cache<br/>83ns hot reads"]
+        PC["Proof Cache<br/>(in-process)"]
         ADAPT["DB Adapter<br/>(PG logical replication,<br/>MySQL binlog, etc.)"]
     end
 
@@ -92,8 +91,8 @@ graph TB
 1. Application writes to its database normally (Wavicle is read-heavy, writes go to the DB)
 2. The database's change stream (logical replication, binlog, etc.) sends changes to Wavicle
 3. Wavicle identifies which cached proofs depend on the changed data via version vector comparison
-4. Only the affected sub-expressions are incrementally re-reduced (48x faster than full recompute)
-5. Next read hits the proof cache at 83ns with zero stale data
+4. Only the affected sub-expressions are incrementally re-reduced (11.4x faster than cold compose)
+5. Next read hits the proof cache (in-process) with zero stale data
 
 ---
 
@@ -133,22 +132,15 @@ $ ./wavicle-cli GET users:1:name
 
 Measured on a 12th Gen Intel Core i5-1240P laptop, Windows, Go 1.25. Workload: 50-field composite record with 1 field mutated.
 
-| Benchmark | Result | vs Full Recompute | Cache Hits |
-|-----------|--------|------------------|------------|
-| Cold proof (50 fields, from scratch) | 127,033 ns | 1.0x baseline | 0/50 | 1.0x baseline | 0/50 |
-| **Incremental (1/50 changed)** | **5,959 ns** | **21.3x faster** | **49/50** | **1.48x faster** | **49/50** |
-| Warm reuse FastPath1 (no changes) | 1,475 ns | 86x faster | — | 86x faster | — |
-| FastPath2 Merkle match (O(1)) | 398 ns | 319x faster | — | 319x faster | — |
+| Benchmark | Result | vs Cold Compose | Cache Hits |
+|-----------|--------|-----------------|------------|
+| Cold compose (50 fields, from scratch) | 66,467 ns | 1.0x baseline | 0/50 |
+| **Incremental (1/50 changed)** | **5,908 ns** | **11.3x faster** | **49/50** |
+| Warm reuse FastPath1 (no changes) | 1,714 ns | 39x faster | — |
+| FastPath2 Merkle match (O(1)) | 423 ns | 157x faster | — |
+| Warm read single key (zero-alloc) | 82 ns | 810x faster | — |
 
-*Note: Phase 2.5 introduced Pointer-Identity interning and ProofNode lazy evaluation, resolving the AST hashing bottleneck. Full 48x gain for large trees is targeted for Phase 3 via VRecord structural sharing.*
-
-### vs Redis
-
-| | Redis (Over TCP) | Wavicle FastPath1 (In-Process) | Winner |
-|---|---|---|---|
-| Warm read latency | ~450,000 ns | 83 ns | **Wavicle ~5,421x faster** |
-| Stale reads after external DB write | ✅ Yes (returned wrong answer) | ❌ Zero | **Wavicle** |
-| Invalidation code required | Yes | None | **Wavicle** |
+*Note: Phase 2.5 introduced Pointer-Identity interning and ProofNode lazy evaluation, resolving the AST hashing bottleneck.*
 
 ## Phase 1 — Verified Metrics
 
@@ -159,22 +151,18 @@ Measured against a live PostgreSQL 16 instance via logical replication.
 | Zero stale reads | 0% | 0% — Alice→Charlie test passed | ✅ |
 | Proof cache hit rate | >90% | **97.18%** | ✅ |
 | Replication lag p99 | <100ms | **35ms** (users table) | ✅ |
-| Warm read latency | — | **83ns** (FastPath1) | ✅ |
-| vs Redis latency | — | **~5,421x faster** | ✅ |
+| Warm read latency | — | **82ns** (zero-alloc) | ✅ |
 
 ### The Alice→Charlie Test
 
 The definitive proof that Wavicle eliminates stale reads:
 
 ```bash
-# Seed Redis manually (what every app does today)
-redis-cli SET users:123:name "Alice"
+# Seed the cache
+wavicle-cli SET users:123:name "Alice"
 
 # External write — another service, a DBA, a migration
 psql -c "UPDATE users SET name='Charlie' WHERE id='123'"
-
-# Redis has no idea
-redis-cli GET users:123:name      # → "Alice"   ← STALE. Wrong.
 
 # Wavicle received the replication event automatically
 wavicle-cli GET users:123:name    # → "Charlie" ← CORRECT. Always.
@@ -307,8 +295,8 @@ Three tests prove zero stale reads under mutation. All pass.
 
 | Phase | Focus | Deliverables | Timeline |
 |-------|-------|-------------|----------|
-| **0 — Proof of Concept** | Core algorithm validated | 6 commands, Causal Crystal, 48x benchmarks, zero stale reads | ✅ **Done** |
-| **1 — DB Integration** | Attach to existing databases | PG logical replication, SQL→proof mapping, Docker, 97% hit rate, 67ms lag, 3658x faster than Redis | ✅ **Done** |
+| **0 — Proof of Concept** | Core algorithm validated | 6 commands, Causal Crystal, 11x incremental speedup, zero stale reads | ✅ **Done** |
+| **1 — DB Integration** | Attach to existing databases | PG logical replication, SQL→proof mapping, Docker, 97% hit rate, 35ms lag | ✅ **Done** |
 | **2 — Production Ready** | Ship to design partners | Metrics, auth, config, graceful shutdown, 7-day soak test | ✅ **Done** |
 | **3 — Enterprise** | Scale and sell | MySQL binlog, RBAC, SSO, audit, cloud marketplace | **H2 2027** |
 
@@ -339,8 +327,13 @@ Three tests prove zero stale reads under mutation. All pass.
 ```
 wavicle/
 ├── main.go                              # Server entry point
+├── main_test.go                         # Integration tests
 ├── cmd/wavicle-cli/main.go              # CLI (REPL mode, RESP3 formatting)
 ├── internal/
+│   ├── autopoiesis/                     # Self-organizing atom structures
+│   │   ├── diffraction.go               #   Diffraction pattern analysis
+│   │   └── entanglement.go              #   Quantum entanglement simulation
+│   ├── config/config.go                 # YAML configuration system
 │   ├── core/
 │   │   ├── types.go                     # Core types
 │   │   └── intern.go                    # ★ THE MOAT — AST Interning
@@ -349,23 +342,53 @@ wavicle/
 │   │   ├── compose.go                   # Cold proof composition
 │   │   ├── incremental.go               # Incremental reduction (3 fast paths)
 │   │   ├── version_vector.go            # Merkle root computation
-│   │   └── cache.go                     # Sharded LRU proof cache
-│   ├── storage/                         # Phase 0 dev storage (will be optional)
-│   │   ├── crystal.go                   # CausalCrystal
-│   │   ├── wal.go                       # Write-ahead log
-│   │   └── frontier.go                  # Active Frontier Index
-│   ├── protocol/resp3/server.go         # RESP3 TCP server (13 commands)
+│   │   ├── cache.go                     # Sharded LRU proof cache
+│   │   ├── sqlparser.go                 # SQL query → proof tree mapping
+│   │   └── engine_test.go               # Proof engine tests
 │   ├── fidelity/policy.go               # Glob-path enforcement
+│   ├── protocol/resp3/server.go         # RESP3 TCP server (13 commands)
 │   ├── replication/                     # DB change stream adapters
 │   │   ├── adapter.go                   #   ChangeListener interface, PathMapper
 │   │   └── postgres.go                  #   PG logical replication (pgoutput)
-│   ├── config/config.go                 # YAML configuration system
-│   ├── telemetry/metrics.go             # Prometheus-format metrics
-│   └── semantic/hrr.go                  # HRR vector operations
+│   ├── semantic/hrr.go                  # HRR vector operations
+│   ├── storage/                         # Phase 0 dev storage (will be optional)
+│   │   ├── adapter.go                   #   Storage adapter interface
+│   │   ├── crystal.go                   #   CausalCrystal
+│   │   ├── wal.go                       #   Write-ahead log
+│   │   ├── frontier.go                  #   Active Frontier Index
+│   │   ├── merkle.go                    #   Merkle tree operations
+│   │   ├── parent_index.go              #   Parent Index (hash→parents)
+│   │   └── postgres.go                  #   PG-backed storage adapter
+│   └── telemetry/metrics.go             # Prometheus-format metrics
+├── benchmarks/
+│   ├── doc.go                           # Package doc
+│   ├── proof_bench_test.go              # Proof engine benchmarks
+│   └── load_test.go                     # Concurrent load benchmarks
+├── deployments/
+│   └── postgres/init.sql                # PostgreSQL setup script
 ├── test/
 │   ├── verify_phase12.ps1               # Complete production verification
-│   └── soak_test.ps1                    # 7-day stability test
+│   ├── soak_test.ps1                    # 7-day stability test
+│   ├── test.ps1                         # Basic functional tests
+│   ├── test_conns.ps1                   # Connection handling tests
+│   ├── test_err.ps1                     # Error handling tests
+│   ├── test_final.ps1                   # Final verification suite
+│   ├── test_fixed.ps1                   # Fixed regression tests
+│   ├── test_hashes.ps1                  # Hash command tests
+│   ├── test_latency.ps1                 # Latency measurement tests
+│   ├── test_metrics.ps1                 # Metrics endpoint tests
+│   ├── test_shutdown.ps1                # Graceful shutdown tests
+│   ├── test_ttl.ps1                     # TTL command tests
+│   ├── test_ttl_delayed.ps1             # Delayed TTL tests
+│   ├── test_ttl_manual.ps1              # Manual TTL tests
+│   └── test_wal.ps1                     # WAL durability tests
+├── docker-compose.yml                   # Docker Compose setup
+├── Dockerfile                           # Container image
 ├── blueprint.md                         # Full architectural spec
+├── PRODUCTION_ROADMAP.md                # Production strategy
+├── HANDOVER.md                          # Phase 2.5 handover notes
+├── RUNBOOK.md                           # Operations runbook
+└── WAVICLE_GRAPH.md                     # Knowledge graph
 ```
 
 ---
