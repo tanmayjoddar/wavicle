@@ -63,8 +63,25 @@ func BenchmarkProofReduction_Incremental_Warm(b *testing.B) {
 		"user:123:field_0", nil, time.Time{},
 	)
 
+	// Save the stale snapshot so we can reset it every iteration
+	staleSnapshot := make(map[string]core.Hash)
+	for k, v := range proof.VersionVector.Entries {
+		staleSnapshot[k] = v
+	}
+	staleMerkle := proof.MerkleRoot
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		// Reset proof state to force incremental reduction
+		proof.VersionVector.Entries = make(map[string]core.Hash)
+		for k, v := range staleSnapshot {
+			proof.VersionVector.Entries[k] = v
+		}
+		proof.MerkleRoot = staleMerkle
+		proof.ReduceStats = engine.ReduceStats{}
+		b.StartTimer()
+		
 		_, _ = engine.ReduceIncremental(proof, crystal)
 	}
 
@@ -141,19 +158,13 @@ func BenchmarkProofReduction_FastPath2_MerkleMatch(b *testing.B) {
 
 func BenchmarkProofReduction_Cold(b *testing.B) {
 	crystal, expr, _, atoms := setup50FieldCrystal(b)
+	
+	// Create a primary path pointing to the compose expr
+	path := "compose_50"
+	crystal.AppendAtom(expr, path, atoms, time.Time{})
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		nodeCache := make(map[core.Hash]core.Value)
-		proof := &engine.MaterializedProof{
-			ProofTree:     expr,
-			VersionVector: &engine.VersionVector{Entries: map[string]core.Hash{"invalid": {}}},
-			NodeCache:     nodeCache,
-			PathToExpr:    map[string]core.Hash{},
-		}
-		for j, atomHash := range atoms {
-			proof.PathToExpr[fmt.Sprintf("user:123:field_%d", j)] = atomHash
-		}
-		_, _ = engine.ReduceIncremental(proof, crystal)
+		_, _ = engine.ComposeProof(crystal, path, core.ModeDeductive)
 	}
 }
