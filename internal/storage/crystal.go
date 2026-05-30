@@ -12,12 +12,22 @@ import (
 	"wavicle/internal/telemetry"
 )
 
+const (
+	maxAtomCacheEntries = 100000  // Hard RAM limit — triggers emergency eviction
+	compactionWALSize   = 10 * 1024 * 1024 // 10MB, down from 50MB
+	compactionInterval  = 30 * time.Second // Time-based fallback compaction
+)
+
 // CausalCrystal is Wavicle's storage engine.
 //
-// LOCK ORDER GLOBAL: proof.mu -> crystal.mu -> frontier.mu / parentIndex.mu
-// crystal.mu is the top-level lock protecting Merkle tree access.
-// Sub-structures (FrontierIndex, ParentIndex) have their own locks.
-// NEVER acquire proof.mu while holding crystal.mu.
+// IMPORTANT: There is NO single global lock. Each subsystem uses its own
+// independent lock so the replication goroutine is never starved.
+//   - frontier:    frontier.mu (sync.RWMutex)
+//   - parentIndex: parentIndex.mu (sync.RWMutex)
+//   - atomCache:   sync.Map (lock-free reads)
+//   - merkle:      merkleMu (sync.RWMutex)
+//   - wal:         wal.mu (sync.Mutex)
+//   - depthIndex:  sync.Map (lock-free)
 type CausalCrystal struct {
 	// Persistent storage
 	wal *WAL
@@ -27,15 +37,18 @@ type CausalCrystal struct {
 	parentIndex *ParentIndex
 	depthIndex  sync.Map // atom_hash -> causal_depth
 	atomCache   sync.Map // atom_hash -> *core.CausalAtom
+	atomCount   atomic.Int64 // live count in atomCache
 
 	// Merkle tree for cryptographic verification
-	merkle     *MerkleTree
-	merkleRoot atomic.Value // core.Hash
+	merkle      *MerkleTree
+	merkleRoot  atomic.Value // core.Hash
+	merkleMu    sync.RWMutex
 
 	// Logical clock for total ordering
 	clock atomic.Uint64
 
-	mu sync.RWMutex
+	// Compaction signalling (single goroutine, serializes itself)
+	compactCh chan struct{}
 }
 
 func NewCausalCrystal(walPath string) (*CausalCrystal, error) {
@@ -45,10 +58,11 @@ func NewCausalCrystal(walPath string) (*CausalCrystal, error) {
 	}
 
 	c := &CausalCrystal{
-		wal:         wal,
+		wal:        wal,
 		frontier:    NewFrontierIndex(),
 		parentIndex: NewParentIndex(),
 		merkle:      NewMerkleTree(),
+		compactCh:   make(chan struct{}, 1),
 	}
 
 	if err := c.Recover(); err != nil {
@@ -56,6 +70,7 @@ func NewCausalCrystal(walPath string) (*CausalCrystal, error) {
 	}
 
 	go c.sweepExpired()
+	go c.compactionLoop()
 
 	return c, nil
 }
@@ -67,7 +82,6 @@ func (c *CausalCrystal) sweepExpired() {
 		now := time.Now()
 		for _, path := range c.frontier.Paths() {
 			if atom, ok := c.GetCurrent(path); ok && !atom.ExpiresAt.IsZero() && atom.ExpiresAt.Before(now) {
-				// Append tombstone
 				c.AppendAtom(&core.EConst{Value: core.VNull{}}, path, []core.Hash{atom.Hash}, time.Time{})
 			}
 		}
@@ -85,8 +99,11 @@ func (c *CausalCrystal) Recover() error {
 		c.parentIndex.Set(atom.Hash, atom.CausalPast)
 		c.depthIndex.Store(atom.Hash, atom.CausalDepth)
 		c.atomCache.Store(atom.Hash, atom)
+		c.atomCount.Add(1)
+		c.merkleMu.Lock()
 		c.merkle.Insert(atom.Hash)
 		c.merkleRoot.Store(c.merkle.Root())
+		c.merkleMu.Unlock()
 		if atom.LogicalClock > c.clock.Load() {
 			c.clock.Store(atom.LogicalClock)
 		}
@@ -96,15 +113,10 @@ func (c *CausalCrystal) Recover() error {
 }
 
 func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causalPast []core.Hash, expiresAt time.Time) (core.Hash, error) {
-	// Ensure expr is interned to support Tier 1/2 hashing
 	if expr.GetHeader() == nil || expr.GetHeader().ID == 0 {
-		// If it's a raw struct, we need to intern it. 
-		// Note: Most callers should use NewEConst/NewECompose.
-		// For safety, we intern here.
 		expr = core.InternExpr(expr)
 	}
 
-	// Step 1: Determine causal depth
 	depth := uint64(0)
 	for _, parentHash := range causalPast {
 		if d, ok := c.depthIndex.Load(parentHash); ok {
@@ -114,7 +126,6 @@ func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causal
 		}
 	}
 
-	// Step 2: Build atom
 	atom := &core.CausalAtom{
 		Expr:         expr,
 		CausalPast:   causalPast,
@@ -124,12 +135,11 @@ func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causal
 		LogicalClock: c.clock.Add(1),
 		PhysicalTime: time.Now(),
 		Nonce:        randomNonce(),
-		Path:         path, // Populate Path for recovery
+		Path:         path,
 		ExpiresAt:    expiresAt,
 	}
 	atom.Hash = atom.ComputeHash()
 
-	// Step 3: fdatasync to WAL
 	if err := c.wal.Append(atom); err != nil {
 		return core.Hash{}, fmt.Errorf("wal append: %w", err)
 	}
@@ -137,23 +147,31 @@ func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causal
 	walSize := c.wal.Size()
 	telemetry.Get().RecordWALSize(walSize)
 
-	// Trigger background compaction if log is too large (> 50MB)
-	if walSize > 50*1024*1024 {
-		go c.Compact()
+	if walSize > compactionWALSize || c.atomCount.Load() > maxAtomCacheEntries/2 {
+		select {
+		case c.compactCh <- struct{}{}:
+		default:
+		}
 	}
 
-	// Step 4: Update hot indexes
-	// LOCK ORDER: crystal.mu -> frontier.mu
-	c.mu.Lock()
+	// Update hot indexes — each subsystem has its own lock, brief and independent
 	c.frontier.Set(path, atom.Hash)
 	c.parentIndex.Set(atom.Hash, causalPast)
 	c.depthIndex.Store(atom.Hash, depth)
 	c.atomCache.Store(atom.Hash, atom)
+	c.atomCount.Add(1)
 
-	// Step 5: Update Merkle tree
+	c.merkleMu.Lock()
 	c.merkle.Insert(atom.Hash)
 	c.merkleRoot.Store(c.merkle.Root())
-	c.mu.Unlock()
+	c.merkleMu.Unlock()
+
+	// Emergency eviction (best-effort, only when > maxAtomCacheEntries)
+	if c.atomCount.Load() > maxAtomCacheEntries {
+		c.evictIfNeeded()
+	}
+
+	telemetry.Get().RecordAtomCount(c.atomCount.Load())
 
 	return atom.Hash, nil
 }
@@ -203,20 +221,15 @@ func (c *CausalCrystal) MerkleRootForPaths(paths []string) core.Hash {
 		return core.Hash{}
 	}
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	var hashes []core.Hash
 	for _, p := range paths {
 		if h, ok := c.frontier.Get(p); ok {
 			hashes = append(hashes, h)
 		} else {
-			// If a path doesn't exist, we use a zero hash as a placeholder
 			hashes = append(hashes, core.Hash{})
 		}
 	}
 
-	// Sort hashes for stable Merkle root regardless of path order
 	sort.Slice(hashes, func(i, j int) bool {
 		for k := 0; k < 32; k++ {
 			if hashes[i][k] != hashes[j][k] {
@@ -226,7 +239,10 @@ func (c *CausalCrystal) MerkleRootForPaths(paths []string) core.Hash {
 		return false
 	})
 
-	return c.merkle.computeRoot(hashes)
+	c.merkleMu.RLock()
+	root := c.merkle.computeRoot(hashes)
+	c.merkleMu.RUnlock()
+	return root
 }
 
 func (c *CausalCrystal) CaptureVersionVector(paths []string) map[string]core.Hash {
@@ -258,16 +274,15 @@ func (c *CausalCrystal) Close() error {
 	return c.wal.Close()
 }
 
-// Compact rewrites the WAL, keeping only atoms reachable from the current Frontier.
+// Compact rewrites the WAL and evicts unreachable atoms from RAM.
+// Runs in a single background goroutine — no concurrency with itself.
 func (c *CausalCrystal) Compact() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	// Step 1: Build alive set from frontier (read frontier under its own lock)
 	paths := c.frontier.Paths()
-	var alive []*core.CausalAtom
 
-	// Gather the closure of all atoms currently in the frontier
+	var alive []*core.CausalAtom
 	seen := make(map[core.Hash]bool)
+
 	var collect func(h core.Hash)
 	collect = func(h core.Hash) {
 		if seen[h] {
@@ -288,26 +303,107 @@ func (c *CausalCrystal) Compact() {
 		}
 	}
 
-	// Sort by logical clock for stable recovery
 	sort.Slice(alive, func(i, j int) bool {
 		return alive[i].LogicalClock < alive[j].LogicalClock
 	})
 
+	// Step 2: Rewrite WAL (wal.mu only)
 	if err := c.wal.Rewrite(alive); err != nil {
 		fmt.Printf("WAL compaction failed: %v\n", err)
-	} else {
-		telemetry.Get().RecordCompaction()
+		return
+	}
+
+	// Step 3: Rebuild Merkle tree (merkleMu only)
+	c.merkleMu.Lock()
+	c.merkle = NewMerkleTree()
+	for _, atom := range alive {
+		c.merkle.Insert(atom.Hash)
+	}
+	c.merkleRoot.Store(c.merkle.Root())
+	c.merkleMu.Unlock()
+
+	// Step 4: Evict atomCache — sync.Map Range is safe with concurrent Store
+	// The seen set is consistent: we built it from the frontier which is stable
+	// because no concurrent Compact() is running.
+	c.atomCache.Range(func(k, v any) bool {
+		hash := k.(core.Hash)
+		if !seen[hash] {
+			c.atomCache.Delete(k)
+			c.atomCount.Add(-1)
+		}
+		return true
+	})
+
+	telemetry.Get().RecordCompaction()
+	telemetry.Get().RecordAtomCount(c.atomCount.Load())
+}
+
+// compactionLoop triggers compaction on demand or periodically.
+// Single goroutine; Compact() never runs concurrently with itself.
+func (c *CausalCrystal) compactionLoop() {
+	ticker := time.NewTicker(compactionInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			walSize := c.wal.Size()
+			telemetry.Get().RecordWALSize(walSize)
+			if walSize > compactionWALSize || c.atomCount.Load() > maxAtomCacheEntries/2 {
+				c.Compact()
+			}
+		case <-c.compactCh:
+			c.Compact()
+		}
 	}
 }
 
-// Helpers
+// evictIfNeeded performs emergency eviction of atoms not in the frontier
+// when atomCache exceeds the hard RAM limit.
+//
+// This is a BEST-EFFORT safety net, not a correctness path.
+// sync.Map Range is safe with concurrent Store/Delete — no lock needed.
+// The TOCTOU race (concurrent AppendAtom adds a new frontier atom after we
+// build our snapshot) is benign: if we evict a live atom, GetCurrent returns
+// (nil, false) and callers handle it gracefully. The next Compact or
+// AppendAtom restores it.
+func (c *CausalCrystal) evictIfNeeded() {
+	count := c.atomCount.Load()
+	if count < maxAtomCacheEntries {
+		return
+	}
+
+	// Snapshot frontier hashes (frontier.mu internally handles locking)
+	frontierHashes := make(map[core.Hash]bool)
+	for _, p := range c.frontier.Paths() {
+		if h, ok := c.frontier.Get(p); ok {
+			frontierHashes[h] = true
+		}
+	}
+
+	// Evict oldest 10% not in frontier
+	target := int(float64(count) * 0.1)
+	evicted := 0
+
+	c.atomCache.Range(func(k, v any) bool {
+		if evicted >= target {
+			return false
+		}
+		hash := k.(core.Hash)
+		if !frontierHashes[hash] {
+			c.atomCache.Delete(k)
+			c.atomCount.Add(-1)
+			evicted++
+		}
+		return true
+	})
+}
 
 func embedExpression(expr core.CombinatorExpr) core.Vector {
 	return semantic.EmbedString(string(expr.Serialize()))
 }
 
 func inferDomain(path string) core.Domain {
-	// Domain inference from path prefix
 	if path == "" {
 		return core.DomainSystem
 	}

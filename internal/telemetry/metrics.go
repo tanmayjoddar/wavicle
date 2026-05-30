@@ -28,6 +28,8 @@ type Metrics struct {
 	// Replication
 	ReplicationLagMs *prometheus.GaugeVec
 
+	// Memory management
+	AtomCount prometheus.Gauge
 
 	// Registry
 	Registry *prometheus.Registry
@@ -101,6 +103,11 @@ func init() {
 		Help: "Current replication lag from external DB in milliseconds.",
 	}, []string{"table"})
 
+	m.AtomCount = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "wavicle_atom_count",
+		Help: "Current number of live atoms in the in-memory cache.",
+	})
+
 	// Register all metrics
 	m.Registry.MustRegister(
 		m.RequestsTotal,
@@ -115,6 +122,7 @@ func init() {
 		m.WALSizeBytes,
 		m.CompactionsTotal,
 		m.ReplicationLagMs,
+		m.AtomCount,
 	)
 
 	global = m
@@ -170,6 +178,10 @@ func (m *Metrics) RecordProofReduction() {
 
 func (m *Metrics) RecordIncrementalHit() {
 	m.IncrementalHitsTotal.Inc()
+}
+
+func (m *Metrics) RecordAtomCount(count int64) {
+	m.AtomCount.Set(float64(count))
 }
 
 func (m *Metrics) RecordReplicationLag(table string, commitTime time.Time) {
