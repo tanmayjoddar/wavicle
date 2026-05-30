@@ -143,7 +143,8 @@ func BenchmarkIncremental_Breakdown(b *testing.B) {
 
 	b.Run("MarkDirty_Upward", func(b *testing.B) {
 		crystal.AppendAtom(core.NewEConst(core.VString("new_value")), "user:123:field_0", nil, time.Time{})
-		changed := crystal.FindChangedPaths(proof.VersionVector.Entries)
+		var changedBuf [64]string
+		changed := crystal.FindChangedPaths(proof.VersionVector.Entries, changedBuf[:0])
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			proof.RootNode.ResetDirty()
@@ -157,15 +158,17 @@ func BenchmarkIncremental_Breakdown(b *testing.B) {
 
 	b.Run("FindChangedPaths", func(b *testing.B) {
 		crystal.AppendAtom(core.NewEConst(core.VString("new_value")), "user:123:field_0", nil, time.Time{})
+		var changedBuf [64]string
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			_ = crystal.FindChangedPaths(proof.VersionVector.Entries)
+			_ = crystal.FindChangedPaths(proof.VersionVector.Entries, changedBuf[:0])
 		}
 	})
 
 	b.Run("ReduceDirty_Only", func(b *testing.B) {
 		crystal.AppendAtom(core.NewEConst(core.VString("new_value")), "user:123:field_0", nil, time.Time{})
-		changed := crystal.FindChangedPaths(proof.VersionVector.Entries)
+		var changedBuf [64]string
+		changed := crystal.FindChangedPaths(proof.VersionVector.Entries, changedBuf[:0])
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			b.StopTimer()
