@@ -83,10 +83,11 @@ func main() {
 									// Preserve existing TTL if one exists
 									var expiresAt time.Time
 									if current, exists := store.GetCurrent(path); exists {
+										// Prevent delayed replication events from overwriting newer local writes
+										if current.PhysicalTime.After(evt.CommitTime) {
+											continue
+										}
 										expiresAt = current.ExpiresAt
-										log.Printf("DEBUG: Preserving TTL for %s: %v (IsZero: %v)", path, expiresAt, expiresAt.IsZero())
-									} else {
-										log.Printf("DEBUG: No current atom found for %s", path)
 									}
 
 									crystal.AppendAtom(expr, path, nil, expiresAt)

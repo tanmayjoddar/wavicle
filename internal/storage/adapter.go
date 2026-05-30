@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"strings"
 	"sync"
 	"time"
 	"wavicle/internal/core"
@@ -46,7 +47,18 @@ func (s *WriteThroughStore) AppendAtom(expr core.CombinatorExpr, path string, pa
 	// Step 1: Write to primary DB
 	_, err := s.Primary.AppendAtom(expr, path, parents, expiresAt)
 	if err != nil {
-		return core.Hash{}, err
+		// Fallback for arbitrary keys or missing tables
+		// This allows Wavicle to function as a general-purpose cache 
+		// for keys that don't fit the Postgres table:id:column schema.
+		if strings.Contains(err.Error(), "invalid path format") || 
+		   strings.Contains(err.Error(), "invalid table name") || 
+		   strings.Contains(err.Error(), "invalid column name") || 
+		   strings.Contains(err.Error(), "does not exist") ||
+		   strings.Contains(err.Error(), "pq: relation") {
+			// Skip the primary error, proceed to local Crystal append
+		} else {
+			return core.Hash{}, err
+		}
 	}
 
 	if !expiresAt.IsZero() {

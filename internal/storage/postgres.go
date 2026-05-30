@@ -65,7 +65,11 @@ func (s *PostgresStore) AppendAtom(expr core.CombinatorExpr, path string, parent
 
 	var val any
 	if ec, ok := expr.(*core.EConst); ok {
-		val = ec.Value
+		if _, isNull := ec.Value.(core.VNull); isNull {
+			val = nil // Translate to SQL NULL
+		} else {
+			val = ec.Value
+		}
 	} else {
 		return core.Hash{}, fmt.Errorf("only EConst expressions are supported for Postgres writes in Phase 1")
 	}
