@@ -1,94 +1,184 @@
 package telemetry
 
 import (
-	"fmt"
 	"net/http"
-	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Simple counter-based metrics. Prometheus integration can replace this.
+// Metrics holds the official Prometheus metrics for Wavicle.
 type Metrics struct {
 	// Request counters
-	Gets     atomic.Int64
-	Sets     atomic.Int64
-	Dels     atomic.Int64
-	MGets    atomic.Int64
-	MSets    atomic.Int64
-	HSets    atomic.Int64
-	HGets    atomic.Int64
-	HGetAlls atomic.Int64
-	Expires  atomic.Int64
-	TTLs     atomic.Int64
-	Exists   atomic.Int64
-	DbSizes  atomic.Int64
-	Pings    atomic.Int64
-	Errors   atomic.Int64
-
-	// Cache metrics
-	CacheHits   atomic.Int64
-	CacheMisses atomic.Int64
+	RequestsTotal *prometheus.CounterVec
+	ErrorsTotal   prometheus.Counter
 
 	// Performance
-	ProofReductions atomic.Int64
-	IncrementalHits atomic.Int64
+	CacheHitsTotal       prometheus.Counter
+	CacheMissesTotal      prometheus.Counter
+	ProofReductionsTotal prometheus.Counter
+	IncrementalHitsTotal prometheus.Counter
+	RequestDuration      *prometheus.HistogramVec
+	ActiveConnections    prometheus.Gauge
+	DBReconnectsTotal    prometheus.Counter
+	WALSizeBytes         prometheus.Gauge
+	CompactionsTotal     prometheus.Counter
 
 	// Replication
-	ReplicationLagMs sync.Map // table (string) -> lag (int64)
+	ReplicationLagMs *prometheus.GaugeVec
+
+
+	// Registry
+	Registry *prometheus.Registry
 }
 
-var global = &Metrics{}
+var global *Metrics
+
+func init() {
+	m := &Metrics{
+		Registry: prometheus.NewRegistry(),
+	}
+
+	m.RequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "wavicle_requests_total",
+		Help: "Total number of RESP3 requests by command.",
+	}, []string{"command"})
+
+	m.ErrorsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "wavicle_errors_total",
+		Help: "Total number of internal errors.",
+	})
+
+	m.CacheHitsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "wavicle_cache_hits_total",
+		Help: "Total number of proof cache hits.",
+	})
+
+	m.CacheMissesTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "wavicle_cache_misses_total",
+		Help: "Total number of proof cache misses.",
+	})
+
+	m.ProofReductionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "wavicle_proof_reductions_total",
+		Help: "Total number of full proof reductions.",
+	})
+
+	m.IncrementalHitsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "wavicle_incremental_hits_total",
+		Help: "Total number of successful incremental reductions.",
+	})
+
+	m.RequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "wavicle_request_duration_seconds",
+		Help:    "Latency of RESP3 commands in seconds.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"command"})
+
+	m.ActiveConnections = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "wavicle_active_connections",
+		Help: "Current number of active client connections.",
+	})
+
+	m.DBReconnectsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "wavicle_db_reconnects_total",
+		Help: "Total number of PostgreSQL replication reconnections.",
+	})
+
+	m.WALSizeBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "wavicle_wal_size_bytes",
+		Help: "Current size of the Write-Ahead Log in bytes.",
+	})
+
+	m.CompactionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "wavicle_compactions_total",
+		Help: "Total number of WAL compactions performed.",
+	})
+
+	m.ReplicationLagMs = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wavicle_replication_lag_ms",
+		Help: "Current replication lag from external DB in milliseconds.",
+	}, []string{"table"})
+
+	// Register all metrics
+	m.Registry.MustRegister(
+		m.RequestsTotal,
+		m.ErrorsTotal,
+		m.CacheHitsTotal,
+		m.CacheMissesTotal,
+		m.ProofReductionsTotal,
+		m.IncrementalHitsTotal,
+		m.RequestDuration,
+		m.ActiveConnections,
+		m.DBReconnectsTotal,
+		m.WALSizeBytes,
+		m.CompactionsTotal,
+		m.ReplicationLagMs,
+	)
+
+	global = m
+}
 
 func Get() *Metrics { return global }
 
-func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+// Helper methods to match the old API while using Prometheus internally
 
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"GET\"} %d\n", m.Gets.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"SET\"} %d\n", m.Sets.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"DEL\"} %d\n", m.Dels.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"MGET\"} %d\n", m.MGets.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"MSET\"} %d\n", m.MSets.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"HSET\"} %d\n", m.HSets.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"HGET\"} %d\n", m.HGets.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"HGETALL\"} %d\n", m.HGetAlls.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"EXPIRE\"} %d\n", m.Expires.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"TTL\"} %d\n", m.TTLs.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"EXISTS\"} %d\n", m.Exists.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"DBSIZE\"} %d\n", m.DbSizes.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"PING\"} %d\n", m.Pings.Load())
-	fmt.Fprintf(w, "wavicle_requests_total{command=\"ERROR\"} %d\n", m.Errors.Load())
-	fmt.Fprintf(w, "wavicle_cache_hits_total %d\n", m.CacheHits.Load())
-	fmt.Fprintf(w, "wavicle_cache_misses_total %d\n", m.CacheMisses.Load())
-	fmt.Fprintf(w, "wavicle_proof_reductions_total %d\n", m.ProofReductions.Load())
-	fmt.Fprintf(w, "wavicle_incremental_hits_total %d\n", m.IncrementalHits.Load())
+func (m *Metrics) RecordRequest(cmd string) {
+	m.RequestsTotal.WithLabelValues(cmd).Inc()
+}
 
-	// Export replication lag. Use a map to track which tables were already exported.
-	exported := make(map[string]bool)
-	m.ReplicationLagMs.Range(func(key, value any) bool {
-		table := key.(string)
-		lag := value.(int64)
-		fmt.Fprintf(w, "wavicle_replication_lag_ms{table=\"%s\"} %d\n", table, lag)
-		exported[table] = true
-		return true
-	})
+func (m *Metrics) RecordDuration(cmd string, duration time.Duration) {
+	m.RequestDuration.WithLabelValues(cmd).Observe(duration.Seconds())
+}
 
-	// Ensure primary Phase 1 tables are always visible to Prometheus
-	for _, table := range []string{"users", "products"} {
-		if !exported[table] {
-			fmt.Fprintf(w, "wavicle_replication_lag_ms{table=\"%s\"} 0\n", table)
-		}
-	}
+func (m *Metrics) IncActiveConnections() {
+	m.ActiveConnections.Inc()
+}
+
+func (m *Metrics) DecActiveConnections() {
+	m.ActiveConnections.Dec()
+}
+
+func (m *Metrics) RecordDBReconnect() {
+	m.DBReconnectsTotal.Inc()
+}
+
+func (m *Metrics) RecordWALSize(size int64) {
+	m.WALSizeBytes.Set(float64(size))
+}
+
+func (m *Metrics) RecordCompaction() {
+	m.CompactionsTotal.Inc()
+}
+
+func (m *Metrics) RecordError() {
+	m.ErrorsTotal.Inc()
+}
+
+func (m *Metrics) RecordCacheHit() {
+	m.CacheHitsTotal.Inc()
+}
+
+func (m *Metrics) RecordCacheMiss() {
+	m.CacheMissesTotal.Inc()
+}
+
+func (m *Metrics) RecordProofReduction() {
+	m.ProofReductionsTotal.Inc()
+}
+
+func (m *Metrics) RecordIncrementalHit() {
+	m.IncrementalHitsTotal.Inc()
 }
 
 func (m *Metrics) RecordReplicationLag(table string, commitTime time.Time) {
 	lag := time.Since(commitTime).Milliseconds()
-	m.ReplicationLagMs.Store(table, lag)
+	m.ReplicationLagMs.WithLabelValues(table).Set(float64(lag))
 }
 
 func ListenAndServe(addr string) error {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", Get())
+	mux.Handle("/metrics", promhttp.HandlerFor(Get().Registry, promhttp.HandlerOpts{}))
 	return http.ListenAndServe(addr, mux)
 }
