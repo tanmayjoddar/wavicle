@@ -21,7 +21,7 @@ func setup50FieldCrystal(b *testing.B) (*storage.CausalCrystal, *core.ECompose, 
 	for i := 0; i < 50; i++ {
 		path := fmt.Sprintf("user:123:field_%d", i)
 		h, err := crystal.AppendAtom(
-			&core.EConst{Value: core.VString(fmt.Sprintf("value_%d", i))},
+			core.NewEConst(core.VString(fmt.Sprintf("value_%d", i))),
 			path, nil, time.Time{},
 		)
 		if err != nil {
@@ -30,40 +30,30 @@ func setup50FieldCrystal(b *testing.B) (*storage.CausalCrystal, *core.ECompose, 
 		atoms = append(atoms, h)
 		entries[path] = h
 	}
-	expr := &core.ECompose{Atoms: atoms}
+	expr := core.NewECompose(atoms)
 	return crystal, expr, entries, atoms
 }
 
-func BenchmarkProofReduction_Incremental_Warm(b *testing.B) {
-	crystal, expr, entries, atoms := setup50FieldCrystal(b)
+func BenchmarkProofReduction_Incremental_Revolutionary(b *testing.B) {
+	crystal, expr, _, atoms := setup50FieldCrystal(b)
+	
+	// Create a primary path pointing to the compose expr
+	path := "compose_50"
+	crystal.AppendAtom(expr, path, atoms, time.Time{})
 
-	proof := &engine.MaterializedProof{
-		ProofTree:     expr,
-		VersionVector: &engine.VersionVector{Entries: entries},
-		NodeCache:     make(map[core.Hash]core.Value),
-		PathToExpr:    make(map[string]core.Hash),
-	}
-	for i, atomHash := range atoms {
-		proof.PathToExpr[fmt.Sprintf("user:123:field_%d", i)] = atomHash
-	}
-
-	warmVal, warmCache, err := engine.ReduceProofTree(expr, crystal)
+	// Build the proof using the new architecture
+	proof, err := engine.ComposeProof(crystal, path, core.ModeDeductive)
 	if err != nil {
 		b.Fatal(err)
 	}
-	proof.NodeCache = warmCache
-	proof.Value = warmVal
 
-	if len(proof.NodeCache) < 50 {
-		b.Fatalf("node cache has %d entries, expected >= 50", len(proof.NodeCache))
-	}
-
+	// Stale the first field
 	crystal.AppendAtom(
-		&core.EConst{Value: core.VString("new_value")},
+		core.NewEConst(core.VString("new_value")),
 		"user:123:field_0", nil, time.Time{},
 	)
 
-	// Save the stale snapshot so we can reset it every iteration
+	// Save the stale state so we can reset it every iteration
 	staleSnapshot := make(map[string]core.Hash)
 	for k, v := range proof.VersionVector.Entries {
 		staleSnapshot[k] = v
@@ -93,28 +83,11 @@ func BenchmarkProofReduction_Incremental_Warm(b *testing.B) {
 }
 
 func BenchmarkProofReduction_WarmReuse_FastPath1(b *testing.B) {
-	crystal, expr, entries, atoms := setup50FieldCrystal(b)
-
-	snapshot := make(map[string]core.Hash)
-	for k, v := range entries {
-		snapshot[k] = v
-	}
-
-	proof := &engine.MaterializedProof{
-		ProofTree:     expr,
-		VersionVector: &engine.VersionVector{Entries: snapshot},
-		NodeCache:     make(map[core.Hash]core.Value),
-		PathToExpr:    make(map[string]core.Hash),
-	}
-	for i, atomHash := range atoms {
-		proof.PathToExpr[fmt.Sprintf("user:123:field_%d", i)] = atomHash
-	}
-
-	warmVal, warmCache, _ := engine.ReduceProofTree(expr, crystal)
-	proof.NodeCache = warmCache
-	proof.Value = warmVal
-
-	engine.ReduceIncremental(proof, crystal)
+	crystal, expr, _, atoms := setup50FieldCrystal(b)
+	path := "compose_50"
+	crystal.AppendAtom(expr, path, atoms, time.Time{})
+	
+	proof, _ := engine.ComposeProof(crystal, path, core.ModeDeductive)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -131,24 +104,17 @@ func BenchmarkProofReduction_FastPath2_MerkleMatch(b *testing.B) {
 
 	var atoms []core.Hash
 	var paths []string
-	entries := make(map[string]core.Hash)
 	for i := 0; i < 10; i++ {
 		path := fmt.Sprintf("path_%d", i)
-		h, _ := crystal.AppendAtom(&core.EConst{Value: core.VString("val")}, path, nil, time.Time{})
+		h, _ := crystal.AppendAtom(core.NewEConst(core.VString("val")), path, nil, time.Time{})
 		atoms = append(atoms, h)
 		paths = append(paths, path)
-		entries[path] = h
 	}
 
-	expr := &core.ECompose{Atoms: atoms}
-	proof := &engine.MaterializedProof{
-		ProofTree:     expr,
-		VersionVector: &engine.VersionVector{Entries: entries},
-		NodeCache:     make(map[core.Hash]core.Value),
-	}
-
-	engine.ReduceIncremental(proof, crystal)
-	proof.MerkleRoot = crystal.MerkleRootForPaths(paths)
+	primaryPath := "compose_10"
+	crystal.AppendAtom(core.NewECompose(atoms), primaryPath, atoms, time.Time{})
+	
+	proof, _ := engine.ComposeProof(crystal, primaryPath, core.ModeDeductive)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -167,4 +133,50 @@ func BenchmarkProofReduction_Cold(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _ = engine.ComposeProof(crystal, path, core.ModeDeductive)
 	}
+}
+
+func BenchmarkIncremental_Breakdown(b *testing.B) {
+	crystal, expr, _, atoms := setup50FieldCrystal(b)
+	path := "compose_50"
+	crystal.AppendAtom(expr, path, atoms, time.Time{})
+	proof, _ := engine.ComposeProof(crystal, path, core.ModeDeductive)
+
+	b.Run("MarkDirty_Upward", func(b *testing.B) {
+		crystal.AppendAtom(core.NewEConst(core.VString("new_value")), "user:123:field_0", nil, time.Time{})
+		changed := crystal.FindChangedPaths(proof.VersionVector.Entries)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			proof.RootNode.ResetDirty()
+			for _, p := range changed {
+				if node, ok := proof.PathToNode[p]; ok {
+					node.PropagateDirtyUp()
+				}
+			}
+		}
+	})
+
+	b.Run("FindChangedPaths", func(b *testing.B) {
+		crystal.AppendAtom(core.NewEConst(core.VString("new_value")), "user:123:field_0", nil, time.Time{})
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = crystal.FindChangedPaths(proof.VersionVector.Entries)
+		}
+	})
+
+	b.Run("ReduceDirty_Only", func(b *testing.B) {
+		crystal.AppendAtom(core.NewEConst(core.VString("new_value")), "user:123:field_0", nil, time.Time{})
+		changed := crystal.FindChangedPaths(proof.VersionVector.Entries)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			proof.RootNode.ResetDirty()
+			for _, p := range changed {
+				if node, ok := proof.PathToNode[p]; ok {
+					node.PropagateDirtyUp()
+				}
+			}
+			b.StartTimer()
+			_, _ = engine.ReduceIncremental(proof, crystal)
+		}
+	})
 }
