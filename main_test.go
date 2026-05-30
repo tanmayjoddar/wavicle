@@ -15,7 +15,7 @@ import (
 func TestEndToEnd(t *testing.T) {
 	crystal, _ := storage.NewCausalCrystal(filepath.Join(t.TempDir(), "e2e_crystal.log"))
 	defer crystal.Close()
-	server := resp3.NewServer(crystal)
+	server := resp3.NewServer(crystal, "", 1000)
 
 	go server.ListenAndServe(":6380")
 	time.Sleep(100 * time.Millisecond)

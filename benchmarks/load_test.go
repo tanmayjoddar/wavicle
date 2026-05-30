@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 	"wavicle/internal/core"
 	"wavicle/internal/engine"
 	"wavicle/internal/storage"
@@ -17,7 +18,7 @@ func BenchmarkConcurrency_1000Clients(b *testing.B) {
 	b.Cleanup(func() { crystal.Close() })
 
 	for i := 0; i < 100; i++ {
-		crystal.AppendAtom(&core.EConst{Value: core.VString("val")}, fmt.Sprintf("key_%d", i), nil)
+		crystal.AppendAtom(&core.EConst{Value: core.VString("val")}, fmt.Sprintf("key_%d", i), nil, time.Time{})
 	}
 
 	b.ResetTimer()
@@ -26,7 +27,7 @@ func BenchmarkConcurrency_1000Clients(b *testing.B) {
 		for pb.Next() {
 			key := fmt.Sprintf("key_%d", i%100)
 			if i%10 == 0 {
-				crystal.AppendAtom(&core.EConst{Value: core.VString("new_val")}, key, nil)
+				crystal.AppendAtom(&core.EConst{Value: core.VString("new_val")}, key, nil, time.Time{})
 			} else {
 				atom, _ := crystal.GetCurrent(key)
 				if atom != nil {
@@ -51,7 +52,7 @@ func BenchmarkWarmRead_Wavicle_vs_RedisSim(b *testing.B) {
 	}
 	b.Cleanup(func() { crystal.Close() })
 	key := "warm_key"
-	h, _ := crystal.AppendAtom(&core.EConst{Value: core.VString("warm_val")}, key, nil)
+	h, _ := crystal.AppendAtom(&core.EConst{Value: core.VString("warm_val")}, key, nil, time.Time{})
 	atom, _ := crystal.GetCurrent(key)
 
 	proof := &engine.MaterializedProof{

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 	"wavicle/internal/core"
 	"wavicle/internal/engine"
 	"wavicle/internal/storage"
@@ -21,7 +22,7 @@ func setup50FieldCrystal(b *testing.B) (*storage.CausalCrystal, *core.ECompose, 
 		path := fmt.Sprintf("user:123:field_%d", i)
 		h, err := crystal.AppendAtom(
 			&core.EConst{Value: core.VString(fmt.Sprintf("value_%d", i))},
-			path, nil,
+			path, nil, time.Time{},
 		)
 		if err != nil {
 			b.Fatal(err)
@@ -59,7 +60,7 @@ func BenchmarkProofReduction_Incremental_Warm(b *testing.B) {
 
 	crystal.AppendAtom(
 		&core.EConst{Value: core.VString("new_value")},
-		"user:123:field_0", nil,
+		"user:123:field_0", nil, time.Time{},
 	)
 
 	b.ResetTimer()
@@ -116,7 +117,7 @@ func BenchmarkProofReduction_FastPath2_MerkleMatch(b *testing.B) {
 	entries := make(map[string]core.Hash)
 	for i := 0; i < 10; i++ {
 		path := fmt.Sprintf("path_%d", i)
-		h, _ := crystal.AppendAtom(&core.EConst{Value: core.VString("val")}, path, nil)
+		h, _ := crystal.AppendAtom(&core.EConst{Value: core.VString("val")}, path, nil, time.Time{})
 		atoms = append(atoms, h)
 		paths = append(paths, path)
 		entries[path] = h
