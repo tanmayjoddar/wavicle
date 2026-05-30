@@ -56,6 +56,61 @@ func (w *WAL) Close() error {
 	return w.file.Close()
 }
 
+func (w *WAL) Size() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	stat, err := w.file.Stat()
+	if err != nil {
+		return 0
+	}
+	return stat.Size()
+}
+
+// Rewrite replaces the current WAL file with a new one containing only the provided atoms.
+func (w *WAL) Rewrite(atoms []*core.CausalAtom) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	tmpPath := w.path + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	for _, a := range atoms {
+		data, err := json.Marshal(a)
+		if err != nil {
+			return err
+		}
+		data = append(data, '\n')
+		if _, err := f.Write(data); err != nil {
+			return err
+		}
+	}
+
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	f.Close()
+
+	// Atomically replace old log
+	if err := w.file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, w.path); err != nil {
+		return err
+	}
+
+	// Reopen
+	newFile, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	w.file = newFile
+	return nil
+}
+
 func (w *WAL) ReadAll() ([]*core.CausalAtom, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

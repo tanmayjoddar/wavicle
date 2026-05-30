@@ -1,13 +1,15 @@
 package storage
 
 import (
+	"sync"
+	"time"
 	"wavicle/internal/core"
 )
 
 // Store is the interface for storage engines (Crystal, Postgres, etc.)
 type Store interface {
 	// AppendAtom adds a new atom to the storage.
-	AppendAtom(expr core.CombinatorExpr, path string, parents []core.Hash) (core.Hash, error)
+	AppendAtom(expr core.CombinatorExpr, path string, parents []core.Hash, expiresAt time.Time) (core.Hash, error)
 
 	// GetCurrent retrieves the latest atom for a given path.
 	GetCurrent(path string) (*core.CausalAtom, bool)
@@ -30,6 +32,7 @@ type Store interface {
 type WriteThroughStore struct {
 	Primary Store
 	Local   *CausalCrystal
+	ttlMap  sync.Map
 }
 
 func NewWriteThroughStore(primary Store, local *CausalCrystal) *WriteThroughStore {
@@ -39,18 +42,21 @@ func NewWriteThroughStore(primary Store, local *CausalCrystal) *WriteThroughStor
 	}
 }
 
-func (s *WriteThroughStore) AppendAtom(expr core.CombinatorExpr, path string, parents []core.Hash) (core.Hash, error) {
+func (s *WriteThroughStore) AppendAtom(expr core.CombinatorExpr, path string, parents []core.Hash, expiresAt time.Time) (core.Hash, error) {
 	// Step 1: Write to primary DB
-	_, err := s.Primary.AppendAtom(expr, path, parents)
+	_, err := s.Primary.AppendAtom(expr, path, parents, expiresAt)
 	if err != nil {
 		return core.Hash{}, err
 	}
 
-	// Step 2: Synchronously update local Crystal to ensure ReadAfterWrite consistency.
-	// The replication listener will later receive the same change, but AppendAtom 
-	// is idempotent for the same path+expr (though hashes might differ due to nonces).
-	// By updating here, we guarantee the next GET sees the change.
-	return s.Local.AppendAtom(expr, path, parents)
+	if !expiresAt.IsZero() {
+		s.ttlMap.Store(path, expiresAt)
+	} else {
+		s.ttlMap.Delete(path)
+	}
+
+	// Step 2: Synchronously update local Crystal
+	return s.Local.AppendAtom(expr, path, parents, expiresAt)
 }
 
 func (s *WriteThroughStore) GetCurrent(path string) (*core.CausalAtom, bool) {
@@ -62,7 +68,7 @@ func (s *WriteThroughStore) GetCurrent(path string) (*core.CausalAtom, bool) {
 	// Fallback to Primary DB (seed the cache)
 	if atom, ok := s.Primary.GetCurrent(path); ok {
 		// Seed the local Crystal so future reads are fast
-		hash, err := s.Local.AppendAtom(atom.Expr, atom.Path, nil)
+		hash, err := s.Local.AppendAtom(atom.Expr, atom.Path, nil, atom.ExpiresAt)
 		if err == nil {
 			return s.Local.GetAtom(hash)
 		}

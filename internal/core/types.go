@@ -257,7 +257,8 @@ type CausalAtom struct {
 	PhysicalTime time.Time
 	Nonce        [16]byte
 	BranchID     [16]byte
-	Path         string // Added for recovery
+	Path         string    // Added for recovery
+	ExpiresAt    time.Time // When the atom expires
 }
 
 func (a *CausalAtom) ComputeHash() Hash {
@@ -265,6 +266,7 @@ func (a *CausalAtom) ComputeHash() Hash {
 	h.Write(a.Expr.Serialize())
 	binary.Write(h, binary.BigEndian, a.LogicalClock)
 	binary.Write(h, binary.BigEndian, uint64(a.PhysicalTime.UnixNano()))
+	binary.Write(h, binary.BigEndian, uint64(a.ExpiresAt.UnixNano()))
 	h.Write(a.Nonce[:])
 	h.Write(a.BranchID[:])
 	binary.Write(h, binary.BigEndian, uint32(len(a.CausalPast)))

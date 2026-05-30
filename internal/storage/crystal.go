@@ -9,6 +9,7 @@ import (
 	"time"
 	"wavicle/internal/core"
 	"wavicle/internal/semantic"
+	"wavicle/internal/telemetry"
 )
 
 // CausalCrystal is Wavicle's storage engine.
@@ -54,7 +55,23 @@ func NewCausalCrystal(walPath string) (*CausalCrystal, error) {
 		return nil, fmt.Errorf("recovery: %w", err)
 	}
 
+	go c.sweepExpired()
+
 	return c, nil
+}
+
+func (c *CausalCrystal) sweepExpired() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		for _, path := range c.frontier.Paths() {
+			if atom, ok := c.GetCurrent(path); ok && !atom.ExpiresAt.IsZero() && atom.ExpiresAt.Before(now) {
+				// Append tombstone
+				c.AppendAtom(&core.EConst{Value: core.VNull{}}, path, []core.Hash{atom.Hash}, time.Time{})
+			}
+		}
+	}
 }
 
 func (c *CausalCrystal) Recover() error {
@@ -78,7 +95,7 @@ func (c *CausalCrystal) Recover() error {
 	return nil
 }
 
-func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causalPast []core.Hash) (core.Hash, error) {
+func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causalPast []core.Hash, expiresAt time.Time) (core.Hash, error) {
 	// Step 1: Determine causal depth
 	depth := uint64(0)
 	for _, parentHash := range causalPast {
@@ -100,6 +117,7 @@ func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causal
 		PhysicalTime: time.Now(),
 		Nonce:        randomNonce(),
 		Path:         path, // Populate Path for recovery
+		ExpiresAt:    expiresAt,
 	}
 	atom.Hash = atom.ComputeHash()
 
@@ -108,14 +126,23 @@ func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causal
 		return core.Hash{}, fmt.Errorf("wal append: %w", err)
 	}
 
+	walSize := c.wal.Size()
+	telemetry.Get().RecordWALSize(walSize)
+
+	// Trigger background compaction if log is too large (> 50MB)
+	if walSize > 50*1024*1024 {
+		go c.Compact()
+	}
+
 	// Step 4: Update hot indexes
+	// LOCK ORDER: crystal.mu -> frontier.mu
+	c.mu.Lock()
 	c.frontier.Set(path, atom.Hash)
 	c.parentIndex.Set(atom.Hash, causalPast)
 	c.depthIndex.Store(atom.Hash, depth)
 	c.atomCache.Store(atom.Hash, atom)
 
 	// Step 5: Update Merkle tree
-	c.mu.Lock()
 	c.merkle.Insert(atom.Hash)
 	c.merkleRoot.Store(c.merkle.Root())
 	c.mu.Unlock()
@@ -214,6 +241,48 @@ func (c *CausalCrystal) FrontierPaths() []string {
 
 func (c *CausalCrystal) Close() error {
 	return c.wal.Close()
+}
+
+// Compact rewrites the WAL, keeping only atoms reachable from the current Frontier.
+func (c *CausalCrystal) Compact() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	paths := c.frontier.Paths()
+	var alive []*core.CausalAtom
+
+	// Gather the closure of all atoms currently in the frontier
+	seen := make(map[core.Hash]bool)
+	var collect func(h core.Hash)
+	collect = func(h core.Hash) {
+		if seen[h] {
+			return
+		}
+		seen[h] = true
+		if atom, ok := c.GetAtom(h); ok {
+			alive = append(alive, atom)
+			for _, p := range atom.CausalPast {
+				collect(p)
+			}
+		}
+	}
+
+	for _, p := range paths {
+		if h, ok := c.frontier.Get(p); ok {
+			collect(h)
+		}
+	}
+
+	// Sort by logical clock for stable recovery
+	sort.Slice(alive, func(i, j int) bool {
+		return alive[i].LogicalClock < alive[j].LogicalClock
+	})
+
+	if err := c.wal.Rewrite(alive); err != nil {
+		fmt.Printf("WAL compaction failed: %v\n", err)
+	} else {
+		telemetry.Get().RecordCompaction()
+	}
 }
 
 // Helpers

@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
+	"unicode"
 	"wavicle/internal/core"
 
 	_ "github.com/lib/pq"
@@ -25,7 +27,22 @@ func NewPostgresStore(dsn string) (*PostgresStore, error) {
 	return &PostgresStore{db: db}, nil
 }
 
-func (s *PostgresStore) AppendAtom(expr core.CombinatorExpr, path string, parents []core.Hash) (core.Hash, error) {
+func isValidIdentifier(s string) bool {
+	if len(s) == 0 || len(s) > 63 { // PostgreSQL max identifier length
+		return false
+	}
+	for i, r := range s {
+		if i == 0 && !unicode.IsLetter(r) && r != '_' {
+			return false
+		}
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *PostgresStore) AppendAtom(expr core.CombinatorExpr, path string, parents []core.Hash, expiresAt time.Time) (core.Hash, error) {
 	// Phase 1: SET key value -> UPDATE table
 	parts := strings.Split(path, ":")
 	if len(parts) < 3 {
@@ -33,8 +50,18 @@ func (s *PostgresStore) AppendAtom(expr core.CombinatorExpr, path string, parent
 	}
 
 	table := parts[0]
-	id := parts[1]
+	id := parts[1] // ID can be any string, passed as parameterized argument
 	column := parts[2]
+
+	// Security Audit: Prevent SQL Injection
+	// Path segments 'table' and 'column' are injected directly into the SQL string.
+	// They must be strictly validated as standard SQL identifiers.
+	if !isValidIdentifier(table) {
+		return core.Hash{}, fmt.Errorf("invalid table name in path: %s", table)
+	}
+	if !isValidIdentifier(column) {
+		return core.Hash{}, fmt.Errorf("invalid column name in path: %s", column)
+	}
 
 	var val any
 	if ec, ok := expr.(*core.EConst); ok {
@@ -44,6 +71,7 @@ func (s *PostgresStore) AppendAtom(expr core.CombinatorExpr, path string, parent
 	}
 
 	// Use UPSERT if possible, or just UPDATE for Phase 1
+	// table and column are validated above to contain only safe characters.
 	query := fmt.Sprintf("INSERT INTO %s (id, %s) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET %s = $2", table, column, column)
 	_, err := s.db.Exec(query, id, val)
 	if err != nil {
@@ -63,6 +91,10 @@ func (s *PostgresStore) GetCurrent(path string) (*core.CausalAtom, bool) {
 	table := parts[0]
 	id := parts[1]
 	column := parts[2]
+
+	if !isValidIdentifier(table) || !isValidIdentifier(column) {
+		return nil, false
+	}
 
 	query := fmt.Sprintf("SELECT %s FROM %s WHERE id = $1", column, table)
 	var val string
