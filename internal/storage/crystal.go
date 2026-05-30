@@ -187,15 +187,15 @@ func (c *CausalCrystal) VerifyVersionVector(entries map[string]core.Hash) bool {
 	return true
 }
 
-func (c *CausalCrystal) FindChangedPaths(entries map[string]core.Hash) []string {
-	var changed []string
+func (c *CausalCrystal) FindChangedPaths(entries map[string]core.Hash, buf []string) []string {
+	buf = buf[:0]
 	for path, expectedHash := range entries {
 		currentHash, ok := c.GetCurrentHash(path)
 		if !ok || currentHash != expectedHash {
-			changed = append(changed, path)
+			buf = append(buf, path)
 		}
 	}
-	return changed
+	return buf
 }
 
 func (c *CausalCrystal) MerkleRootForPaths(paths []string) core.Hash {
@@ -237,6 +237,13 @@ func (c *CausalCrystal) CaptureVersionVector(paths []string) map[string]core.Has
 		}
 	}
 	return res
+}
+
+func (c *CausalCrystal) MerkleRoot() core.Hash {
+	if v, ok := c.merkleRoot.Load().(core.Hash); ok {
+		return v
+	}
+	return core.Hash{}
 }
 
 func (c *CausalCrystal) GetParents(hash core.Hash) ([]core.Hash, bool) {
