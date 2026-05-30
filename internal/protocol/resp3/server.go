@@ -2,12 +2,16 @@ package resp3
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha3"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 	"wavicle/internal/core"
 	"wavicle/internal/engine"
 	"wavicle/internal/fidelity"
@@ -16,16 +20,31 @@ import (
 )
 
 type Server struct {
-	store      storage.Store
-	proofCache *engine.ProofCache
-	policy     *fidelity.FidelityPolicy
+	store       storage.Store
+	proofCache  *engine.ProofCache
+	policy      *fidelity.FidelityPolicy
+	password    string
+	maxConns    int
+	activeConns atomic.Int32
+	listener    net.Listener
+	wg          sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
-func NewServer(store storage.Store) *Server {
+func NewServer(store storage.Store, password string, maxConns int) *Server {
+	if maxConns <= 0 {
+		maxConns = 10000
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		store:      store,
 		proofCache: engine.NewProofCache(64, 10000),
 		policy:     &fidelity.DefaultPolicy,
+		password:   password,
+		maxConns:   maxConns,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 }
 
@@ -34,21 +53,52 @@ func (s *Server) ListenAndServe(addr string) error {
 	if err != nil {
 		return err
 	}
+	s.listener = l
 	defer l.Close()
 
 	for {
 		conn, err := l.Accept()
 		if err != nil {
+			select {
+			case <-s.ctx.Done():
+				return nil // Shutting down gracefully
+			default:
+				continue
+			}
+		}
+
+		if s.activeConns.Load() >= int32(s.maxConns) {
+			conn.Write([]byte("-ERR max number of clients reached\r\n"))
+			conn.Close()
 			continue
 		}
+
+		s.activeConns.Add(1)
+		s.wg.Add(1)
 		go s.handleConnection(conn)
 	}
 }
 
+func (s *Server) Close() {
+	s.cancel()
+	if s.listener != nil {
+		s.listener.Close()
+	}
+	s.wg.Wait()
+}
+
 func (s *Server) handleConnection(conn net.Conn) {
+	defer s.wg.Done()
 	defer conn.Close()
+	defer s.activeConns.Add(-1)
+	defer telemetry.Get().DecActiveConnections()
+
+	telemetry.Get().IncActiveConnections()
+
 	br := bufio.NewReader(conn)
 	bw := bufio.NewWriter(conn)
+
+	authenticated := s.password == ""
 
 	for {
 		args, err := readCommand(br)
@@ -57,6 +107,34 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 		if len(args) == 0 {
 			continue
+		}
+
+		cmd := strings.ToUpper(args[0])
+
+		// Handle AUTH separately
+		if cmd == "AUTH" {
+			if len(args) < 2 {
+				bw.WriteString("-ERR wrong number of arguments for 'auth' command\r\n")
+			} else if s.password == "" {
+				bw.WriteString("-ERR Client sent AUTH, but no password is set\r\n")
+			} else if args[1] == s.password {
+				authenticated = true
+				bw.WriteString("+OK\r\n")
+			} else {
+				bw.WriteString("-ERR invalid password\r\n")
+			}
+			bw.Flush()
+			continue
+		}
+
+		if !authenticated {
+			// Only PING is allowed unauthenticated in some Redis-like configs, 
+			// but we'll be strict: only AUTH or PING.
+			if cmd != "PING" {
+				bw.WriteString("-NOAUTH Authentication required.\r\n")
+				bw.Flush()
+				continue
+			}
 		}
 
 		resp, err := s.HandleCommand(args)
@@ -126,15 +204,19 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 	if len(args) == 0 {
 		return "", fmt.Errorf("empty command")
 	}
+	start := time.Now()
 	cmd := strings.ToUpper(args[0])
+	defer func() {
+		telemetry.Get().RecordDuration(cmd, time.Since(start))
+	}()
 
 	switch cmd {
 	case "PING":
-		telemetry.Get().Pings.Add(1)
+		telemetry.Get().RecordRequest("PING")
 		return "+PONG\r\n", nil
 
 	case "SET":
-		telemetry.Get().Sets.Add(1)
+		telemetry.Get().RecordRequest("SET")
 		if len(args) < 3 {
 			return "", fmt.Errorf("wrong number of arguments for 'set' command")
 		}
@@ -149,15 +231,15 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 			causalPast = []core.Hash{prev.Hash}
 		}
 
-		if _, err := s.store.AppendAtom(expr, path, causalPast); err != nil {
-			telemetry.Get().Errors.Add(1)
+		if _, err := s.store.AppendAtom(expr, path, causalPast, time.Time{}); err != nil {
+			telemetry.Get().RecordError()
 			return "", err
 		}
 
 		return "+OK\r\n", nil
 
 	case "GET":
-		telemetry.Get().Gets.Add(1)
+		telemetry.Get().RecordRequest("GET")
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'get' command")
 		}
@@ -178,7 +260,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 				if proof, ok := s.proofCache.Get(queryHash); ok {
 					val, err := engine.ReduceIncremental(proof, s.store)
 					if err == nil {
-						telemetry.Get().CacheHits.Add(1)
+						telemetry.Get().RecordCacheHit()
 						return formatValue(val), nil
 					}
 				}
@@ -186,7 +268,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 				// If not in cache or stale, reduce the new expr
 				val, cache, err := engine.ReduceProofTree(expr, s.store)
 				if err == nil {
-					telemetry.Get().ProofReductions.Add(1)
+					telemetry.Get().RecordProofReduction()
 					_ = cache // Future: populate nodeCache in MaterializedProof
 					return formatValue(val), nil
 				}
@@ -201,29 +283,29 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 
 		current, ok := s.store.GetCurrent(path)
 		if !ok {
-			telemetry.Get().CacheMisses.Add(1)
+			telemetry.Get().RecordCacheMiss()
 			return "$-1\r\n", nil
 		}
 		// Return nil for tombstoned keys
 		if isTombstone(current) {
-			telemetry.Get().CacheMisses.Add(1)
+			telemetry.Get().RecordCacheMiss()
 			return "$-1\r\n", nil
 		}
 
 		if proof, ok := s.proofCache.Get(queryHash); ok {
 			val, err := engine.ReduceIncremental(proof, s.store)
 			if err == nil {
-				telemetry.Get().CacheHits.Add(1)
-				telemetry.Get().IncrementalHits.Add(1)
+				telemetry.Get().RecordCacheHit()
+				telemetry.Get().RecordIncrementalHit()
 				return formatValue(val), nil
 			}
 		}
 
-		telemetry.Get().CacheMisses.Add(1)
-		telemetry.Get().ProofReductions.Add(1)
+		telemetry.Get().RecordCacheMiss()
+		telemetry.Get().RecordProofReduction()
 		proof, err := engine.ComposeProof(s.store, path, core.ModeDeductive)
 		if err != nil {
-			telemetry.Get().Errors.Add(1)
+			telemetry.Get().RecordError()
 			return "", err
 		}
 		s.proofCache.Set(queryHash, proof)
@@ -231,7 +313,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return formatValue(proof.Value), nil
 
 	case "DEL":
-		telemetry.Get().Dels.Add(1)
+		telemetry.Get().RecordRequest("DEL")
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'del' command")
 		}
@@ -240,7 +322,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 			if prev, ok := s.store.GetCurrent(path); ok {
 				expr := &core.EConst{Value: core.VNull{}}
 				causalPast := []core.Hash{prev.Hash}
-				if _, err := s.store.AppendAtom(expr, path, causalPast); err == nil {
+				if _, err := s.store.AppendAtom(expr, path, causalPast, time.Time{}); err == nil {
 					deleted++
 				}
 			}
@@ -248,7 +330,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return fmt.Sprintf(":%d\r\n", deleted), nil
 
 	case "EXISTS":
-		telemetry.Get().Exists.Add(1)
+		telemetry.Get().RecordRequest("EXISTS")
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'exists' command")
 		}
@@ -263,7 +345,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return fmt.Sprintf(":%d\r\n", count), nil
 
 	case "DBSIZE":
-		telemetry.Get().DbSizes.Add(1)
+		telemetry.Get().RecordRequest("DBSIZE")
 		count := 0
 		for _, path := range s.store.FrontierPaths() {
 			if atom, ok := s.store.GetCurrent(path); ok && !isTombstone(atom) {
@@ -273,7 +355,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return fmt.Sprintf(":%d\r\n", count), nil
 
 	case "MGET":
-		telemetry.Get().MGets.Add(1)
+		telemetry.Get().RecordRequest("MGET")
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'mget' command")
 		}
@@ -294,7 +376,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 			if proof, ok := s.proofCache.Get(queryHash); ok {
 				val, err := engine.ReduceIncremental(proof, s.store)
 				if err == nil {
-					telemetry.Get().CacheHits.Add(1)
+					telemetry.Get().RecordCacheHit()
 					resp += formatValue(val)
 					continue
 				}
@@ -310,7 +392,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return resp, nil
 
 	case "MSET":
-		telemetry.Get().MSets.Add(1)
+		telemetry.Get().RecordRequest("MSET")
 		if len(args) < 3 || len(args[1:])%2 != 0 {
 			return "", fmt.Errorf("wrong number of arguments for 'mset' command")
 		}
@@ -324,15 +406,15 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 			if prev, ok := s.store.GetCurrent(path); ok {
 				causalPast = []core.Hash{prev.Hash}
 			}
-			if _, err := s.store.AppendAtom(expr, path, causalPast); err != nil {
-				telemetry.Get().Errors.Add(1)
+			if _, err := s.store.AppendAtom(expr, path, causalPast, time.Time{}); err != nil {
+				telemetry.Get().RecordError()
 				return "", err
 			}
 		}
 		return "+OK\r\n", nil
 
 	case "HSET":
-		telemetry.Get().HSets.Add(1)
+		telemetry.Get().RecordRequest("HSET")
 		if len(args) < 4 {
 			return "", fmt.Errorf("wrong number of arguments for 'hset' command")
 		}
@@ -346,14 +428,14 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		if prev, ok := s.store.GetCurrent(hashPath); ok {
 			causalPast = []core.Hash{prev.Hash}
 		}
-		if _, err := s.store.AppendAtom(expr, hashPath, causalPast); err != nil {
-			telemetry.Get().Errors.Add(1)
+		if _, err := s.store.AppendAtom(expr, hashPath, causalPast, time.Time{}); err != nil {
+			telemetry.Get().RecordError()
 			return "", err
 		}
 		return ":1\r\n", nil
 
 	case "HGET":
-		telemetry.Get().HGets.Add(1)
+		telemetry.Get().RecordRequest("HGET")
 		if len(args) < 3 {
 			return "", fmt.Errorf("wrong number of arguments for 'hget' command")
 		}
@@ -373,7 +455,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		if proof, ok := s.proofCache.Get(queryHash); ok {
 			val, err := engine.ReduceIncremental(proof, s.store)
 			if err == nil {
-				telemetry.Get().CacheHits.Add(1)
+				telemetry.Get().RecordCacheHit()
 				return formatValue(val), nil
 			}
 		}
@@ -385,7 +467,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return formatValue(proof.Value), nil
 
 	case "HGETALL":
-		telemetry.Get().HGetAlls.Add(1)
+		telemetry.Get().RecordRequest("HGETALL")
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'hgetall' command")
 		}
@@ -414,7 +496,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 			if proof, ok := s.proofCache.Get(queryHash); ok {
 				val, err := engine.ReduceIncremental(proof, s.store)
 				if err == nil {
-					telemetry.Get().CacheHits.Add(1)
+					telemetry.Get().RecordCacheHit()
 					valStr = formatValue(val)
 				}
 			}
@@ -435,7 +517,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return resp, nil
 
 	case "EXPIRE":
-		telemetry.Get().Expires.Add(1)
+		telemetry.Get().RecordRequest("EXPIRE")
 		if len(args) < 3 {
 			return "", fmt.Errorf("wrong number of arguments for 'expire' command")
 		}
@@ -451,11 +533,17 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		if !ok || isTombstone(current) {
 			return ":0\r\n", nil
 		}
-		// Phase 1: TTL is handled by the primary DB
+		
+		// Append a new atom with the same value but updated ExpiresAt
+		expiresAt := time.Now().Add(time.Duration(seconds) * time.Second)
+		if _, err := s.store.AppendAtom(current.Expr, path, []core.Hash{current.Hash}, expiresAt); err != nil {
+			telemetry.Get().RecordError()
+			return "", err
+		}
 		return ":1\r\n", nil
 
 	case "TTL":
-		telemetry.Get().TTLs.Add(1)
+		telemetry.Get().RecordRequest("TTL")
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'ttl' command")
 		}
@@ -463,7 +551,15 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		if !ok || isTombstone(current) {
 			return ":-2\r\n", nil
 		}
-		return ":-1\r\n", nil
+		
+		if current.ExpiresAt.IsZero() {
+			return ":-1\r\n", nil
+		}
+		ttl := time.Until(current.ExpiresAt).Seconds()
+		if ttl <= 0 {
+			return ":-2\r\n", nil
+		}
+		return fmt.Sprintf(":%d\r\n", int(ttl)), nil
 
 	default:
 		return "", fmt.Errorf("unknown command '%s'", cmd)

@@ -40,6 +40,7 @@ func main() {
 	}
 
 	var store storage.Store = crystal
+	var pgListener *replication.PGListener
 
 	// Phase 1: Enable external database integration
 	if cfg.DB.Type == "postgres" {
@@ -51,7 +52,7 @@ func main() {
 		store = storage.NewWriteThroughStore(pgStore, crystal)
 
 		// Start Replication Listener
-		pgListener := replication.NewPGListener(replication.PGConfig{
+		pgListener = replication.NewPGListener(replication.PGConfig{
 			DSN:             cfg.DB.DSN,
 			ReplicationSlot: cfg.DB.ReplicationSlot,
 			Publication:     cfg.DB.Publication,
@@ -68,9 +69,9 @@ func main() {
 					telemetry.Get().RecordReplicationLag(evt.Table, evt.CommitTime)
 					for _, path := range evt.AffectedPaths {
 						log.Printf("DB Change [%s]: path %s (lag: %v)", evt.Action, path, time.Since(evt.CommitTime))
-						
+
 						if evt.Action == "DELETE" {
-							crystal.AppendAtom(&core.EConst{Value: core.VNull{}}, path, nil)
+							crystal.AppendAtom(&core.EConst{Value: core.VNull{}}, path, nil, time.Time{})
 						} else {
 							// For Phase 1, we find the column name from the end of the path
 							lastColon := strings.LastIndex(path, ":")
@@ -78,7 +79,17 @@ func main() {
 								column := path[lastColon+1:]
 								if val, ok := evt.NewValues[column]; ok {
 									expr := &core.EConst{Value: core.VString(fmt.Sprint(val))}
-									crystal.AppendAtom(expr, path, nil)
+
+									// Preserve existing TTL if one exists
+									var expiresAt time.Time
+									if current, exists := store.GetCurrent(path); exists {
+										expiresAt = current.ExpiresAt
+										log.Printf("DEBUG: Preserving TTL for %s: %v (IsZero: %v)", path, expiresAt, expiresAt.IsZero())
+									} else {
+										log.Printf("DEBUG: No current atom found for %s", path)
+									}
+
+									crystal.AppendAtom(expr, path, nil, expiresAt)
 								}
 							}
 						}
@@ -88,7 +99,7 @@ func main() {
 		}
 	}
 
-	srv := resp3.NewServer(store)
+	srv := resp3.NewServer(store, cfg.Auth.Password, cfg.Server.MaxConns)
 
 	// Start metrics HTTP server
 	if cfg.Metrics.Enabled {
@@ -112,7 +123,33 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
-	log.Printf("Received signal %v, shutting down...", sig)
+	log.Printf("Received signal %v, initiating graceful shutdown...", sig)
+
+	// Context with timeout for shutdown
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	// Notify server to stop accepting new connections
+	srv.Close()
+
+	// Clean up replication slot (optional, but good practice for clean shutdown)
+	if pgListener != nil {
+		log.Println("Stopping PostgreSQL replication listener...")
+		// If we wanted to drop the slot, we would do it here.
+		// For now, closing the listener is sufficient to stop the stream.
+		// Note: pgListener doesn't have a Close method exposed in the current interface,
+		// but canceling the main context stops it.
+		cancel()
+	}
+
+	// Wait for active connections to drain (simulated via wait group in a real app)
+	// For now, we wait for a brief period to allow in-flight requests to finish
+	select {
+	case <-shutdownCtx.Done():
+		log.Println("Shutdown timeout reached. Forcing exit.")
+	case <-time.After(2 * time.Second): // Give connections 2 seconds to drain
+		log.Println("Connections drained.")
+	}
 
 	store.Close()
 	log.Println("Shutdown complete.")

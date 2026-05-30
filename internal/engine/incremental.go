@@ -197,23 +197,69 @@ func mergeInto(target core.VRecord, val core.Value) {
 }
 
 func applyCombinator(f, a core.Value) (core.Value, error) {
-	// K(x)(y) = x — constant combinator
+	// Standard SKI Combinator Calculus
+	// I x = x
+	// K x y = x
+	// S x y z = x z (y z)
+
 	switch v := f.(type) {
 	case core.VString:
-		if string(v) == "K" {
+		s := string(v)
+		switch s {
+		case "I":
+			// I a = a
 			return a, nil
+		case "K":
+			// First argument of K: K a. Returns a closure/record representing (K a).
+			return core.VRecord{"fn": core.VString("K_partial"), "arg1": a}, nil
+		case "S":
+			// First argument of S: S a. Returns a closure/record representing (S a).
+			return core.VRecord{"fn": core.VString("S_partial1"), "arg1": a}, nil
+		default:
+			return core.VRecord{"fn": f, "arg": a}, nil
 		}
-		return core.VRecord{"fn": v, "arg": a}, nil
+
 	case core.VRecord:
-		// Unwrap single-entry record
-		if len(v) == 1 {
-			for _, val := range v {
-				if s, ok := val.(core.VString); ok && string(s) == "K" {
-					return a, nil
-				}
-			}
+		fn, ok := v["fn"].(core.VString)
+		if !ok {
+			return core.VRecord{"fn": f, "arg": a}, nil
 		}
-		return v, nil
+
+		switch string(fn) {
+		case "K_partial":
+			// (K a) b = a
+			return v["arg1"], nil
+
+		case "S_partial1":
+			// (S a) b. Returns a closure/record representing (S a b).
+			return core.VRecord{"fn": core.VString("S_partial2"), "arg1": v["arg1"], "arg2": a}, nil
+
+		case "S_partial2":
+			// ((S a) b) c = (a c) (b c)
+			// This requires two further applications. 
+			// In our current engine, we return a representation of the pending applications.
+			// The reducer will eventually need to reduce these.
+			a_val := v["arg1"]
+			b_val := v["arg2"]
+			c_val := a
+
+			// (a c)
+			ac, err := applyCombinator(a_val, c_val)
+			if err != nil {
+				return nil, err
+			}
+			// (b c)
+			bc, err := applyCombinator(b_val, c_val)
+			if err != nil {
+				return nil, err
+			}
+			// (a c) (b c)
+			return applyCombinator(ac, bc)
+
+		default:
+			return core.VRecord{"fn": f, "arg": a}, nil
+		}
+
 	default:
 		return core.VRecord{"fn": f, "arg": a}, nil
 	}

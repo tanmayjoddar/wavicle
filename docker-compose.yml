@@ -12,6 +12,8 @@ services:
       - WAVICLE_DB_TYPE=postgres
       - WAVICLE_DB_DSN=postgres://wavicle:wavicle@db:5432/wavicle?sslmode=disable
       - WAVICLE_METRICS_ENABLED=true
+      - WAVICLE_AUTH_PASSWORD=testpass
+      - WAVICLE_MAX_CONNS=20
     volumes:
       - wavicle-data:/var/lib/wavicle
 

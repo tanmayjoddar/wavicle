@@ -14,7 +14,12 @@ type Config struct {
 	Engine  EngineConfig  `yaml:"engine"`
 	DB      DBConfig      `yaml:"db"`
 	Metrics MetricsConfig `yaml:"metrics"`
+	Auth    AuthConfig    `yaml:"auth"`
 	Logging LoggingConfig `yaml:"logging"`
+}
+
+type AuthConfig struct {
+	Password string `yaml:"requirepass"`
 }
 
 type ServerConfig struct {
@@ -107,6 +112,11 @@ func (c *Config) LoadFromEnv() {
 	if v := os.Getenv("WAVICLE_SERVER_LISTEN"); v != "" {
 		c.Server.Listen = v
 	}
+	if v := os.Getenv("WAVICLE_MAX_CONNS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.Server.MaxConns = i
+		}
+	}
 	if v := os.Getenv("WAVICLE_STORAGE_ENGINE"); v != "" {
 		c.Storage.Engine = v
 	}
@@ -133,6 +143,9 @@ func (c *Config) LoadFromEnv() {
 	}
 	if v := os.Getenv("WAVICLE_LOG_LEVEL"); v != "" {
 		c.Logging.Level = v
+	}
+	if v := os.Getenv("WAVICLE_AUTH_PASSWORD"); v != "" {
+		c.Auth.Password = v
 	}
 
 	// Internal limits
