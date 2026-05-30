@@ -45,7 +45,7 @@ func BenchmarkConcurrency_1000Clients(b *testing.B) {
 	})
 }
 
-func BenchmarkWarmRead_Wavicle_vs_RedisSim(b *testing.B) {
+func BenchmarkWarmRead_Wavicle(b *testing.B) {
 	crystal, err := storage.NewCausalCrystal(filepath.Join(b.TempDir(), "bench_warm.log"))
 	if err != nil {
 		b.Fatal(err)
@@ -62,18 +62,9 @@ func BenchmarkWarmRead_Wavicle_vs_RedisSim(b *testing.B) {
 		NodeCache:     make(map[core.Hash]core.Value),
 	}
 
-	b.Run("Wavicle_WarmRead", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			_, _ = engine.ReduceIncremental(proof, crystal)
-		}
-	})
-
-	redisSim := make(map[string]string)
-	redisSim[key] = "warm_val"
-
-	b.Run("RedisSim_EngineOnly", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			_ = redisSim[key]
-		}
-	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = engine.ReduceIncremental(proof, crystal)
+	}
 }
+
