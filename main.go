@@ -34,22 +34,22 @@ func main() {
 		log.Fatalf("Cannot create data directory: %v", err)
 	}
 
-	crystal, err := storage.NewCausalCrystal(filepath.Join(cfg.Storage.DataDir, "crystal.log"))
-	if err != nil {
-		log.Fatalf("Failed to initialize storage: %v", err)
-	}
-
-	var store storage.Store = crystal
+	// Production mode (PostgreSQL): FrontierCache + PG write-through + replication listener.
+	// Dev mode (no PG): standalone CausalCrystal.
+	var store storage.Store
 	var pgListener *replication.PGListener
 
-	// Phase 1: Enable external database integration
 	if cfg.DB.Type == "postgres" {
 		log.Printf("Initializing PostgreSQL write-through to %s", cfg.DB.DSN)
 		pgStore, err := storage.NewPostgresStore(cfg.DB.DSN)
 		if err != nil {
 			log.Fatalf("Failed to connect to Postgres: %v", err)
 		}
-		store = storage.NewWriteThroughStore(pgStore, crystal)
+
+		// FrontierCache: O(unique keys) memory, no WAL, no compaction, no ancestry.
+		// PG is source of truth; local cache is a fast read-through for the Proof Engine.
+		local := storage.NewFrontierCache()
+		store = storage.NewWriteThroughStore(pgStore, local)
 
 		// Start Replication Listener
 		pgListener = replication.NewPGListener(replication.PGConfig{
@@ -71,26 +71,29 @@ func main() {
 						log.Printf("DB Change [%s]: path %s (lag: %v)", evt.Action, path, time.Since(evt.CommitTime))
 
 						if evt.Action == "DELETE" {
-							crystal.AppendAtom(&core.EConst{Value: core.VNull{}}, path, nil, time.Time{})
+							local.AppendAtom(&core.EConst{Value: core.VNull{}}, path, nil, time.Time{})
 						} else {
-							// For Phase 1, we find the column name from the end of the path
 							lastColon := strings.LastIndex(path, ":")
 							if lastColon != -1 {
 								column := path[lastColon+1:]
 								if val, ok := evt.NewValues[column]; ok {
-									expr := &core.EConst{Value: core.VString(fmt.Sprint(val))}
+									valStr := fmt.Sprint(val)
 
-									// Preserve existing TTL if one exists
 									var expiresAt time.Time
 									if current, exists := store.GetCurrent(path); exists {
-										// Prevent delayed replication events from overwriting newer local writes
 										if current.PhysicalTime.After(evt.CommitTime) {
+											continue
+										}
+										// Replication echo guard: skip if the value hasn't changed.
+										// Otherwise the echo creates a new atom with a different hash,
+										// invalidating all cached proofs for zero semantic change.
+										if ec, ok := current.Expr.(*core.EConst); ok && fmt.Sprint(ec.Value) == valStr {
 											continue
 										}
 										expiresAt = current.ExpiresAt
 									}
 
-									crystal.AppendAtom(expr, path, nil, expiresAt)
+									local.AppendAtom(&core.EConst{Value: core.VString(valStr)}, path, nil, expiresAt)
 								}
 							}
 						}
@@ -98,6 +101,14 @@ func main() {
 				}
 			}()
 		}
+	} else {
+		// Dev mode: full CausalCrystal with WAL, compaction, and causal DAG.
+		// No PG involvement — standalone operation.
+		crystal, err := storage.NewCausalCrystal(filepath.Join(cfg.Storage.DataDir, "crystal.log"))
+		if err != nil {
+			log.Fatalf("Failed to initialize storage: %v", err)
+		}
+		store = crystal
 	}
 
 	srv := resp3.NewServer(store, cfg.Auth.Password, cfg.Server.MaxConns)
