@@ -22,14 +22,11 @@ type Metrics struct {
 	RequestDuration      *prometheus.HistogramVec
 	ActiveConnections    prometheus.Gauge
 	DBReconnectsTotal    prometheus.Counter
-	WALSizeBytes         prometheus.Gauge
-	CompactionsTotal     prometheus.Counter
+	AtomCount            prometheus.Gauge // Renamed from FrontierCacheEntries for consistency
+	TTLEvictionsTotal    prometheus.Counter
 
 	// Replication
 	ReplicationLagMs *prometheus.GaugeVec
-
-	// Memory management
-	AtomCount prometheus.Gauge
 
 	// Registry
 	Registry *prometheus.Registry
@@ -88,25 +85,20 @@ func init() {
 		Help: "Total number of PostgreSQL replication reconnections.",
 	})
 
-	m.WALSizeBytes = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "wavicle_wal_size_bytes",
-		Help: "Current size of the Write-Ahead Log in bytes.",
+	m.AtomCount = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "wavicle_atom_count",
+		Help: "Current number of live atoms in the frontier cache (one per unique key).",
 	})
 
-	m.CompactionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "wavicle_compactions_total",
-		Help: "Total number of WAL compactions performed.",
+	m.TTLEvictionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "wavicle_ttl_evictions_total",
+		Help: "Total number of items automatically evicted due to TTL expiry.",
 	})
 
 	m.ReplicationLagMs = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wavicle_replication_lag_ms",
 		Help: "Current replication lag from external DB in milliseconds.",
 	}, []string{"table"})
-
-	m.AtomCount = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "wavicle_atom_count",
-		Help: "Current number of live atoms in the in-memory cache.",
-	})
 
 	// Register all metrics
 	m.Registry.MustRegister(
@@ -119,10 +111,9 @@ func init() {
 		m.RequestDuration,
 		m.ActiveConnections,
 		m.DBReconnectsTotal,
-		m.WALSizeBytes,
-		m.CompactionsTotal,
-		m.ReplicationLagMs,
 		m.AtomCount,
+		m.TTLEvictionsTotal,
+		m.ReplicationLagMs,
 	)
 
 	global = m
@@ -152,12 +143,8 @@ func (m *Metrics) RecordDBReconnect() {
 	m.DBReconnectsTotal.Inc()
 }
 
-func (m *Metrics) RecordWALSize(size int64) {
-	m.WALSizeBytes.Set(float64(size))
-}
-
-func (m *Metrics) RecordCompaction() {
-	m.CompactionsTotal.Inc()
+func (m *Metrics) RecordTTLEviction() {
+	m.TTLEvictionsTotal.Inc()
 }
 
 func (m *Metrics) RecordError() {
