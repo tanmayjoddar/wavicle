@@ -1,13 +1,14 @@
 package storage
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"time"
 	"wavicle/internal/core"
 )
 
-// Store is the interface for storage engines (Crystal, Postgres, etc.)
+// Store is the interface for storage engines (Crystal, FrontierCache, Postgres, etc.)
 type Store interface {
 	// AppendAtom adds a new atom to the storage.
 	AppendAtom(expr core.CombinatorExpr, path string, parents []core.Hash, expiresAt time.Time) (core.Hash, error)
@@ -26,17 +27,29 @@ type Store interface {
 
 	// Close releases storage resources.
 	Close() error
+
+	// GetCurrentHash returns the hash of the current atom for a path.
+	GetCurrentHash(path string) (core.Hash, bool)
+
+	// FindChangedPaths returns paths whose hashes differ from the given version vector.
+	FindChangedPaths(entries map[string]core.Hash, buf []string) []string
+
+	// VerifyVersionVector returns true if all path hashes match the current frontier.
+	VerifyVersionVector(entries map[string]core.Hash) bool
 }
 
-// WriteThroughStore wraps a primary database and the local Causal Crystal.
-// Writes go to the DB first, then are reflected back via the ChangeListener.
+// WriteThroughStore wraps a primary database and a local cache.
+// Writes go to the DB first, then to the local cache. The local cache is
+// kept up-to-date via the ChangeListener for external DB changes.
+// In production mode, the local cache is a FrontierCache (O(unique keys) memory).
+// In dev mode, the local cache is a CausalCrystal (full DAG, WAL, compaction).
 type WriteThroughStore struct {
 	Primary Store
-	Local   *CausalCrystal
+	Local   Store
 	ttlMap  sync.Map
 }
 
-func NewWriteThroughStore(primary Store, local *CausalCrystal) *WriteThroughStore {
+func NewWriteThroughStore(primary Store, local Store) *WriteThroughStore {
 	return &WriteThroughStore{
 		Primary: primary,
 		Local:   local,
@@ -72,14 +85,32 @@ func (s *WriteThroughStore) AppendAtom(expr core.CombinatorExpr, path string, pa
 }
 
 func (s *WriteThroughStore) GetCurrent(path string) (*core.CausalAtom, bool) {
-	// Try local Crystal first (83ns path)
-	if atom, ok := s.Local.GetCurrent(path); ok {
-		return atom, true
+	// Try local Crystal first (fast path)
+	if cached, ok := s.Local.GetCurrent(path); ok {
+		// Only verify against PG if atom is older than 5 seconds.
+		// This prevents PG hammering under load while still catching
+		// external writes within a reasonable window. Replication handles
+		// the real-time path; this is a backup for edge cases.
+		if len(cached.CausalPast) == 0 &&
+			time.Since(cached.PhysicalTime) > 30*time.Second {
+			if pgAtom, pgOk := s.Primary.GetCurrent(path); pgOk {
+				cv, cok := extractAtomValue(cached)
+				pv, pok := extractAtomValue(pgAtom)
+				if !cok || !pok || cv != pv {
+					hash, err := s.Local.AppendAtom(pgAtom.Expr, pgAtom.Path, nil, pgAtom.ExpiresAt)
+					if err == nil {
+						if updated, ok := s.Local.GetAtom(hash); ok {
+							return updated, true
+						}
+					}
+				}
+			}
+		}
+		return cached, true
 	}
 
 	// Fallback to Primary DB (seed the cache)
 	if atom, ok := s.Primary.GetCurrent(path); ok {
-		// Seed the local Crystal so future reads are fast
 		hash, err := s.Local.AppendAtom(atom.Expr, atom.Path, nil, atom.ExpiresAt)
 		if err == nil {
 			return s.Local.GetAtom(hash)
@@ -90,12 +121,34 @@ func (s *WriteThroughStore) GetCurrent(path string) (*core.CausalAtom, bool) {
 	return nil, false
 }
 
+func extractAtomValue(atom *core.CausalAtom) (string, bool) {
+	if atom == nil || atom.Expr == nil {
+		return "", false
+	}
+	if e, ok := atom.Expr.(*core.EConst); ok {
+		return fmt.Sprint(e.Value), true
+	}
+	return "", false
+}
+
 func (s *WriteThroughStore) GetParents(hash core.Hash) ([]core.Hash, bool) {
 	return s.Local.GetParents(hash)
 }
 
 func (s *WriteThroughStore) GetAtom(hash core.Hash) (*core.CausalAtom, bool) {
 	return s.Local.GetAtom(hash)
+}
+
+func (s *WriteThroughStore) GetCurrentHash(path string) (core.Hash, bool) {
+	return s.Local.GetCurrentHash(path)
+}
+
+func (s *WriteThroughStore) FindChangedPaths(entries map[string]core.Hash, buf []string) []string {
+	return s.Local.FindChangedPaths(entries, buf)
+}
+
+func (s *WriteThroughStore) VerifyVersionVector(entries map[string]core.Hash) bool {
+	return s.Local.VerifyVersionVector(entries)
 }
 
 func (s *WriteThroughStore) FrontierPaths() []string {
