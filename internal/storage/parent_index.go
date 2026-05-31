@@ -29,3 +29,9 @@ func (p *ParentIndex) Set(hash core.Hash, parents []core.Hash) {
 	defer p.mu.Unlock()
 	p.parents[hash] = parents
 }
+
+func (p *ParentIndex) Delete(hash core.Hash) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.parents, hash)
+}

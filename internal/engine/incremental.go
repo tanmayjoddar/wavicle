@@ -7,8 +7,8 @@ import (
 	"wavicle/internal/storage"
 )
 
-// crystalQuery is the subset of CausalCrystal used by ComputeProofMerkleRoot.
-type crystalQuery interface {
+// localQuery is the subset of CausalCrystal used by ComputeProofMerkleRoot.
+type localQuery interface {
 	GetCurrentHash(path string) (core.Hash, bool)
 }
 
@@ -19,7 +19,7 @@ type ReduceStats struct {
 	DurationNanos int64
 }
 
-// ReduceIncremental brings a cached proof up-to-date with the current crystal frontier.
+// ReduceIncremental brings a cached proof up-to-date with the current local frontier.
 // It uses three levels of optimization to reach theoretical speed bounds:
 // 1. FAST PATH 1 (O(m)): Version vector exact match. Return cached value immediately.
 // 2. FAST PATH 2 (O(1)): Merkle root match. Return cached value immediately.
@@ -34,20 +34,18 @@ func ReduceIncremental(
 	proof.ReduceStats = ReduceStats{}
 	start := time.Now()
 
-	// In Phase 1, we assume the local storage is a CausalCrystal for these optimizations
-	crystal, isCrystal := store.(*storage.CausalCrystal)
-	if !isCrystal {
-		// Fallback for non-crystal stores: full re-reduce
-		newValue, err := reduceTree(proof.ProofTree, store, proof.NodeCache, proof)
-		if err != nil {
-			return nil, err
-		}
-		proof.Value = newValue
-		return newValue, nil
+	// Extract the local store for fast-path operations.
+	// Works with CausalCrystal, FrontierCache, or WriteThroughStore wrapping either.
+	var local storage.Store
+	switch s := store.(type) {
+	case *storage.WriteThroughStore:
+		local = s.Local
+	default:
+		local = s
 	}
 
 	// FAST PATH 1: Version vector exact match — O(m)
-	if crystal.VerifyVersionVector(proof.VersionVector.Entries) {
+	if local.VerifyVersionVector(proof.VersionVector.Entries) {
 		proof.AccessCount++
 		proof.LastVerifiedAt = time.Now().UnixNano()
 		return proof.Value, nil
@@ -62,7 +60,7 @@ func ReduceIncremental(
 
 	// INCREMENTAL PATH — find which paths changed, zero-alloc
 	var changedBuf [64]string
-	changedPathsList := crystal.FindChangedPaths(proof.VersionVector.Entries, changedBuf[:0])
+	changedPathsList := local.FindChangedPaths(proof.VersionVector.Entries, changedBuf[:0])
 	proof.ReduceStats.ChangedPaths = len(changedPathsList)
 
 	var newValue core.Value
@@ -77,10 +75,10 @@ func ReduceIncremental(
 			}
 		}
 
-		newValue, err = reduceDirty(proof.RootNode, crystal, proof)
+		newValue, err = reduceDirty(proof.RootNode, local, proof)
 	} else {
 		// Legacy slow path (fallback)
-		newValue, err = reduceTree(proof.ProofTree, crystal, proof.NodeCache, proof)
+		newValue, err = reduceTree(proof.ProofTree, local, proof.NodeCache, proof)
 	}
 
 	if err != nil {
@@ -91,7 +89,7 @@ func ReduceIncremental(
 	
 	// Update version vector for next fast-path read
 	for _, path := range changedPathsList {
-		if h, ok := crystal.GetCurrentHash(path); ok {
+		if h, ok := local.GetCurrentHash(path); ok {
 			proof.VersionVector.Entries[path] = h
 		}
 	}
@@ -105,7 +103,7 @@ func ReduceIncremental(
 	return proof.Value, nil
 }
 
-func reduceDirty(node *ProofNode, crystal *storage.CausalCrystal, proof *MaterializedProof) (core.Value, error) {
+func reduceDirty(node *ProofNode, local storage.Store, proof *MaterializedProof) (core.Value, error) {
 	// O(1) cache hit — zero hash, direct pointer
 	if !node.Dirty && node.CachedValue != nil {
 		proof.ReduceStats.CacheHits++
@@ -114,9 +112,9 @@ func reduceDirty(node *ProofNode, crystal *storage.CausalCrystal, proof *Materia
 
 	proof.ReduceStats.CacheMisses++
 
-	// If this node represents a leaf (atom), update its expression from the crystal
+	// If this node represents a leaf (atom), update its expression from the local
 	if node.SourcePath != "" && node.Dirty {
-		if currentAtom, ok := crystal.GetCurrent(node.SourcePath); ok {
+		if currentAtom, ok := local.GetCurrent(node.SourcePath); ok {
 			node.Expr = currentAtom.Expr
 			node.SourceHash = currentAtom.Hash
 		}
@@ -136,7 +134,7 @@ func reduceDirty(node *ProofNode, crystal *storage.CausalCrystal, proof *Materia
 	switch e := node.Expr.(type) {
 	case *core.EFieldAccess:
 		if len(node.Children) > 0 {
-			sourceVal, err := reduceDirty(node.Children[0], crystal, proof)
+			sourceVal, err := reduceDirty(node.Children[0], local, proof)
 			if err != nil {
 				return nil, err
 			}
@@ -153,32 +151,32 @@ func reduceDirty(node *ProofNode, crystal *storage.CausalCrystal, proof *Materia
 		switch n {
 		case 0:
 		case 1:
-			subVal, err := reduceDirty(children[0], crystal, proof)
+			subVal, err := reduceDirty(children[0], local, proof)
 			if err != nil {
 				return nil, err
 			}
 			record[children[0].SourcePath] = subVal
 		case 2:
-			subVal0, err := reduceDirty(children[0], crystal, proof)
+			subVal0, err := reduceDirty(children[0], local, proof)
 			if err != nil {
 				return nil, err
 			}
-			subVal1, err := reduceDirty(children[1], crystal, proof)
+			subVal1, err := reduceDirty(children[1], local, proof)
 			if err != nil {
 				return nil, err
 			}
 			record[children[0].SourcePath] = subVal0
 			record[children[1].SourcePath] = subVal1
 		case 3:
-			subVal0, err := reduceDirty(children[0], crystal, proof)
+			subVal0, err := reduceDirty(children[0], local, proof)
 			if err != nil {
 				return nil, err
 			}
-			subVal1, err := reduceDirty(children[1], crystal, proof)
+			subVal1, err := reduceDirty(children[1], local, proof)
 			if err != nil {
 				return nil, err
 			}
-			subVal2, err := reduceDirty(children[2], crystal, proof)
+			subVal2, err := reduceDirty(children[2], local, proof)
 			if err != nil {
 				return nil, err
 			}
@@ -187,7 +185,7 @@ func reduceDirty(node *ProofNode, crystal *storage.CausalCrystal, proof *Materia
 			record[children[2].SourcePath] = subVal2
 		default:
 			for _, childNode := range children {
-				subVal, err := reduceDirty(childNode, crystal, proof)
+				subVal, err := reduceDirty(childNode, local, proof)
 				if err != nil {
 					return nil, err
 				}
@@ -198,11 +196,11 @@ func reduceDirty(node *ProofNode, crystal *storage.CausalCrystal, proof *Materia
 
 	case *core.EApply:
 		if len(node.Children) >= 2 {
-			funcVal, err := reduceDirty(node.Children[0], crystal, proof)
+			funcVal, err := reduceDirty(node.Children[0], local, proof)
 			if err != nil {
 				return nil, err
 			}
-			argVal, err := reduceDirty(node.Children[1], crystal, proof)
+			argVal, err := reduceDirty(node.Children[1], local, proof)
 			if err != nil {
 				return nil, err
 			}
@@ -227,11 +225,15 @@ func reduceDirty(node *ProofNode, crystal *storage.CausalCrystal, proof *Materia
 
 func reduceTree(
 	expr core.CombinatorExpr,
-	crystal storage.Store,
+	local storage.Store,
 	nodeCache map[core.Hash]core.Value,
 	proof *MaterializedProof,
 ) (core.Value, error) {
 	exprHash := expr.ExprHash()
+
+	if nodeCache == nil {
+		nodeCache = make(map[core.Hash]core.Value)
+	}
 
 	if cached, ok := nodeCache[exprHash]; ok {
 		if proof != nil {
@@ -252,7 +254,7 @@ func reduceTree(
 		result = e.Value
 
 	case *core.EFieldAccess:
-		sourceVal, err := reduceTree(e.Source, crystal, nodeCache, proof)
+		sourceVal, err := reduceTree(e.Source, local, nodeCache, proof)
 		if err != nil {
 			return nil, err
 		}
@@ -268,21 +270,21 @@ func reduceTree(
 			
 			// Optimization: if we have the path, use it
 			// Note: this assumes atoms in ECompose are atoms with paths.
-			if atom, ok := crystal.GetAtom(origHash); ok && atom.Path != "" {
-				if current, ok := crystal.GetCurrent(atom.Path); ok {
+			if atom, ok := local.GetAtom(origHash); ok && atom.Path != "" {
+				if current, ok := local.GetCurrent(atom.Path); ok {
 					atomToReduce = current
 				} else {
 					atomToReduce = atom
 				}
 			} else {
-				atomToReduce, _ = crystal.GetAtom(origHash)
+				atomToReduce, _ = local.GetAtom(origHash)
 			}
 
 			if atomToReduce == nil {
 				return nil, fmt.Errorf("atom not found: %x", origHash)
 			}
 
-			subVal, err := reduceTree(atomToReduce.Expr, crystal, nodeCache, proof)
+			subVal, err := reduceTree(atomToReduce.Expr, local, nodeCache, proof)
 			if err != nil {
 				return nil, err
 			}
@@ -291,11 +293,11 @@ func reduceTree(
 		result = record
 
 	case *core.EApply:
-		funcVal, err := reduceTree(e.Func, crystal, nodeCache, proof)
+		funcVal, err := reduceTree(e.Func, local, nodeCache, proof)
 		if err != nil {
 			return nil, err
 		}
-		argVal, err := reduceTree(e.Arg, crystal, nodeCache, proof)
+		argVal, err := reduceTree(e.Arg, local, nodeCache, proof)
 		if err != nil {
 			return nil, err
 		}

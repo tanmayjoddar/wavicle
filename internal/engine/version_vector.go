@@ -6,7 +6,7 @@ import (
 	"wavicle/internal/storage"
 )
 
-func ComputeVersionMerkleRoot(vv *VersionVector, crystal *storage.CausalCrystal) core.Hash {
+func ComputeVersionMerkleRoot(vv *VersionVector, crystal storage.Store) core.Hash {
 	paths := make([]string, 0, len(vv.Entries))
 	for p := range vv.Entries {
 		paths = append(paths, p)

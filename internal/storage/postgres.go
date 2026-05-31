@@ -124,6 +124,22 @@ func (s *PostgresStore) GetAtom(hash core.Hash) (*core.CausalAtom, bool) {
 	return nil, false
 }
 
+func (s *PostgresStore) GetCurrentHash(path string) (core.Hash, bool) {
+	atom, ok := s.GetCurrent(path)
+	if !ok {
+		return core.Hash{}, false
+	}
+	return atom.Hash, true
+}
+
+func (s *PostgresStore) FindChangedPaths(entries map[string]core.Hash, buf []string) []string {
+	return buf[:0]
+}
+
+func (s *PostgresStore) VerifyVersionVector(entries map[string]core.Hash) bool {
+	return false
+}
+
 func (s *PostgresStore) FrontierPaths() []string {
 	return nil
 }

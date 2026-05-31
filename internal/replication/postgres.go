@@ -38,6 +38,7 @@ type PGListener struct {
 	conn      *pgconn.PgConn
 	relations map[uint32]*pglogrepl.RelationMessage
 	mu        sync.Mutex
+	lastLSN   pglogrepl.LSN
 	running   atomic.Bool
 }
 
@@ -112,6 +113,14 @@ func (l *PGListener) connectAndConsume(ctx context.Context) error {
 		}
 	}
 
+	// Close previous connection if any (prevents PG connection leak on reconnect)
+	l.mu.Lock()
+	if l.conn != nil {
+		l.conn.Close(context.Background())
+		l.conn = nil
+	}
+	l.mu.Unlock()
+
 	conn, err := pgconn.Connect(ctx, replDSN)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
@@ -133,8 +142,11 @@ func (l *PGListener) connectAndConsume(ctx context.Context) error {
 	_, _ = pglogrepl.CreateReplicationSlot(ctx, conn, slotName, "pgoutput",
 		pglogrepl.CreateReplicationSlotOptions{Temporary: false})
 
-	// Start replication from LSN 0 (earliest available)
-	err = pglogrepl.StartReplication(ctx, conn, slotName, 0,
+	// Start replication from last known position (0 = earliest available)
+	// Tracking and sending lastLSN in StandbyStatusUpdate prevents PG from
+	// resending already-processed WAL on reconnect, avoiding duplicate atoms.
+	startLSN := l.getLastLSN()
+	err = pglogrepl.StartReplication(ctx, conn, slotName, startLSN,
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{
 				"proto_version '1'",
@@ -157,7 +169,7 @@ func (l *PGListener) connectAndConsume(ctx context.Context) error {
 
 		if time.Since(lastKeepalive) > keepalivePeriod {
 			pglogrepl.SendStandbyStatusUpdate(ctx, conn,
-				pglogrepl.StandbyStatusUpdate{WALWritePosition: 0})
+				pglogrepl.StandbyStatusUpdate{WALWritePosition: l.getLastLSN()})
 			lastKeepalive = time.Now()
 		}
 
@@ -167,7 +179,7 @@ func (l *PGListener) connectAndConsume(ctx context.Context) error {
 		if err != nil {
 			if pgconn.Timeout(err) {
 				pglogrepl.SendStandbyStatusUpdate(ctx, conn,
-					pglogrepl.StandbyStatusUpdate{WALWritePosition: 0})
+					pglogrepl.StandbyStatusUpdate{WALWritePosition: l.getLastLSN()})
 				lastKeepalive = time.Now()
 				continue
 			}
@@ -186,6 +198,12 @@ func (l *PGListener) connectAndConsume(ctx context.Context) error {
 			// Ignore notices
 		}
 	}
+}
+
+func (l *PGListener) getLastLSN() pglogrepl.LSN {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lastLSN
 }
 
 // handleCopyData processes a CopyData message from the replication stream.
@@ -209,7 +227,7 @@ func (l *PGListener) handleCopyData(ctx context.Context, conn *pgconn.PgConn, da
 		}
 		if pkm.ReplyRequested {
 			pglogrepl.SendStandbyStatusUpdate(ctx, conn,
-				pglogrepl.StandbyStatusUpdate{WALWritePosition: pkm.ServerWALEnd})
+				pglogrepl.StandbyStatusUpdate{WALWritePosition: l.getLastLSN()})
 		}
 		return nil
 
@@ -224,6 +242,12 @@ func (l *PGListener) processXLogData(ctx context.Context, conn *pgconn.PgConn, d
 	if err != nil {
 		return fmt.Errorf("parse xlog: %w", err)
 	}
+
+	// Track last processed LSN so reconnect resumes from here instead of 0.
+	// This prevents re-processing already-consumed WAL events.
+	l.mu.Lock()
+	l.lastLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
+	l.mu.Unlock()
 
 	logicalMsg, err := pglogrepl.Parse(xld.WALData)
 	if err != nil {

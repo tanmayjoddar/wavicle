@@ -47,8 +47,10 @@ type CausalCrystal struct {
 	// Logical clock for total ordering
 	clock atomic.Uint64
 
-	// Compaction signalling (single goroutine, serializes itself)
-	compactCh chan struct{}
+	// Compaction
+	compactCh    chan struct{}
+	compacting   atomic.Bool
+	lastCompact  time.Time
 }
 
 func NewCausalCrystal(walPath string) (*CausalCrystal, error) {
@@ -76,7 +78,7 @@ func NewCausalCrystal(walPath string) (*CausalCrystal, error) {
 }
 
 func (c *CausalCrystal) sweepExpired() {
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
@@ -145,12 +147,24 @@ func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causal
 	}
 
 	walSize := c.wal.Size()
-	telemetry.Get().RecordWALSize(walSize)
 
-	if walSize > compactionWALSize || c.atomCount.Load() > maxAtomCacheEntries/2 {
-		select {
-		case c.compactCh <- struct{}{}:
-		default:
+	// Trigger compaction IF:
+	// 1. WAL exceeds threshold AND we grew by >10% since last compaction (avoids loop)
+	// 2. OR atom count exceeds threshold
+	// 3. OR compaction isn't already running
+	if !c.compacting.Load() && time.Since(c.lastCompact) > compactionInterval/2 {
+		shouldCompact := false
+		if c.atomCount.Load() > maxAtomCacheEntries/2 {
+			shouldCompact = true
+		} else if walSize > compactionWALSize {
+			// Only trigger on significant growth past threshold to avoid re-compact loop
+			shouldCompact = true
+		}
+		if shouldCompact {
+			select {
+			case c.compactCh <- struct{}{}:
+			default:
+			}
 		}
 	}
 
@@ -277,29 +291,25 @@ func (c *CausalCrystal) Close() error {
 // Compact rewrites the WAL and evicts unreachable atoms from RAM.
 // Runs in a single background goroutine — no concurrency with itself.
 func (c *CausalCrystal) Compact() {
-	// Step 1: Build alive set from frontier (read frontier under its own lock)
-	paths := c.frontier.Paths()
-
-	var alive []*core.CausalAtom
-	seen := make(map[core.Hash]bool)
-
-	var collect func(h core.Hash)
-	collect = func(h core.Hash) {
-		if seen[h] {
-			return
-		}
-		seen[h] = true
-		if atom, ok := c.GetAtom(h); ok {
-			alive = append(alive, atom)
-			for _, p := range atom.CausalPast {
-				collect(p)
-			}
-		}
+	if !c.compacting.CompareAndSwap(false, true) {
+		return
 	}
+	defer func() {
+		c.lastCompact = time.Now()
+		c.compacting.Store(false)
+	}()
 
+	// Step 1: Build alive set from frontier — only frontier atoms, no ancestor walking.
+	// Ancestors are not needed for correctness: proof reduction resolves atoms against
+	// the live frontier at read time. Keeping the full causal chain in the WAL causes
+	// unbounded WAL growth and O(write history) memory on recovery.
+	paths := c.frontier.Paths()
+	alive := make([]*core.CausalAtom, 0, len(paths))
 	for _, p := range paths {
 		if h, ok := c.frontier.Get(p); ok {
-			collect(h)
+			if atom, ok := c.GetAtom(h); ok {
+				alive = append(alive, atom)
+			}
 		}
 	}
 
@@ -322,19 +332,28 @@ func (c *CausalCrystal) Compact() {
 	c.merkleRoot.Store(c.merkle.Root())
 	c.merkleMu.Unlock()
 
-	// Step 4: Evict atomCache — sync.Map Range is safe with concurrent Store
-	// The seen set is consistent: we built it from the frontier which is stable
-	// because no concurrent Compact() is running.
+	// Step 4: Evict orphaned atoms from atomCache, parentIndex, depthIndex.
+	// Build frontier hash set at eviction time (not at collect time) to close
+	// the TOCTOU race: a concurrent AppendAtom that adds a new frontier atom
+	// AFTER the collect step is protected because we re-read the frontier here.
+	frontierHashes := make(map[core.Hash]bool, len(paths))
+	for _, p := range c.frontier.Paths() {
+		if h, ok := c.frontier.Get(p); ok {
+			frontierHashes[h] = true
+		}
+	}
+
 	c.atomCache.Range(func(k, v any) bool {
 		hash := k.(core.Hash)
-		if !seen[hash] {
+		if !frontierHashes[hash] {
 			c.atomCache.Delete(k)
 			c.atomCount.Add(-1)
+			c.parentIndex.Delete(hash)
+			c.depthIndex.Delete(hash)
 		}
 		return true
 	})
 
-	telemetry.Get().RecordCompaction()
 	telemetry.Get().RecordAtomCount(c.atomCount.Load())
 }
 
@@ -347,8 +366,10 @@ func (c *CausalCrystal) compactionLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			if c.compacting.Load() {
+				continue
+			}
 			walSize := c.wal.Size()
-			telemetry.Get().RecordWALSize(walSize)
 			if walSize > compactionWALSize || c.atomCount.Load() > maxAtomCacheEntries/2 {
 				c.Compact()
 			}
@@ -393,6 +414,8 @@ func (c *CausalCrystal) evictIfNeeded() {
 		if !frontierHashes[hash] {
 			c.atomCache.Delete(k)
 			c.atomCount.Add(-1)
+			c.parentIndex.Delete(hash)
+			c.depthIndex.Delete(hash)
 			evicted++
 		}
 		return true

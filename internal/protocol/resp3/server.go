@@ -39,7 +39,7 @@ func NewServer(store storage.Store, password string, maxConns int) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		store:      store,
-		proofCache: engine.NewProofCache(64, 10000),
+		proofCache: engine.NewProofCache(64, 2000),
 		policy:     &fidelity.DefaultPolicy,
 		password:   password,
 		maxConns:   maxConns,

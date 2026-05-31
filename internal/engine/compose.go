@@ -24,16 +24,36 @@ func ComposeProof(store storage.Store, path string, mode core.ObservationMode) (
 		ProofTree:     proofTree,
 		RootNode:      rootNode,
 		PathToNode:    pathToNode,
+		NodeCache:     make(map[core.Hash]core.Value),
 		VersionVector: captureVersionVector(store, relevantAtoms),
 	}
 
-	if crystal, ok := store.(*storage.CausalCrystal); ok {
-		proof.MerkleRoot = ComputeVersionMerkleRoot(proof.VersionVector, crystal)
-		// Perform a cold reduction on the RootNode to populate its CachedValue fields
-		val, _ := reduceDirty(proof.RootNode, crystal, proof)
-		proof.Value = val
-		proof.ValueHash = core.HashValue(val)
+	// Extract the local store (works with CausalCrystal, FrontierCache, or WriteThroughStore)
+	var local storage.Store
+	switch s := store.(type) {
+	case *storage.WriteThroughStore:
+		local = s.Local
+	default:
+		local = s
 	}
+
+	// Include all proof tree paths in the version vector so that field-level
+	// changes (e.g., poison writes to a compose child) are detected by
+	// ReduceIncremental's FAST PATH 1 version-vector check.
+	for _, node := range pathToNode {
+		if node.SourcePath != "" {
+			if _, exists := proof.VersionVector.Entries[node.SourcePath]; !exists {
+				if h, ok := local.GetCurrentHash(node.SourcePath); ok {
+					proof.VersionVector.Entries[node.SourcePath] = h
+				}
+			}
+		}
+	}
+
+	proof.MerkleRoot = ComputeVersionMerkleRoot(proof.VersionVector, local)
+	val, _ := reduceDirty(proof.RootNode, local, proof)
+	proof.Value = val
+	proof.ValueHash = core.HashValue(val)
 
 	return proof, nil
 }
@@ -68,38 +88,16 @@ func buildProofNode(store storage.Store, path string, parent *ProofNode, pathInd
 }
 
 func gatherCausalClosure(crystal storage.Store, path string) ([]*core.CausalAtom, error) {
-	seen := make(map[core.Hash]bool)
-	var collect func(h core.Hash)
-	collect = func(h core.Hash) {
-		if seen[h] {
-			return
-		}
-		seen[h] = true
-		parents, ok := crystal.GetParents(h)
-		if !ok {
-			return
-		}
-		for _, p := range parents {
-			collect(p)
-		}
-	}
-
 	atom, ok := crystal.GetCurrent(path)
 	if !ok {
 		return nil, fmt.Errorf("path not found: %s", path)
 	}
-	seen[atom.Hash] = true
-	for _, p := range atom.CausalPast {
-		collect(p)
-	}
-
-	var atoms []*core.CausalAtom
-	for h := range seen {
-		if a, ok := crystal.GetAtom(h); ok {
-			atoms = append(atoms, a)
-		}
-	}
-	return atoms, nil
+	// Only return the current frontier atom.
+	// Historical ancestors are not needed for proof reduction —
+	// reduceTree re-resolves all atoms against the live frontier at read time.
+	// Loading the full causal chain causes O(write history) memory growth
+	// which is unbounded under sustained load.
+	return []*core.CausalAtom{atom}, nil
 }
 
 func buildProofTree(crystal storage.Store, atoms []*core.CausalAtom, primaryPath string) core.CombinatorExpr {
@@ -127,7 +125,13 @@ func captureVersionVector(crystal storage.Store, atoms []*core.CausalAtom) *Vers
 	entries := make(map[string]core.Hash)
 	for _, a := range atoms {
 		if a.Path != "" {
-			entries[a.Path] = a.Hash
+			// Always use the current frontier hash, not the historical atom hash.
+			// This ensures the version vector reflects live state.
+			if current, ok := crystal.GetCurrent(a.Path); ok {
+				entries[a.Path] = current.Hash
+			} else {
+				entries[a.Path] = a.Hash
+			}
 		}
 	}
 	return &VersionVector{Entries: entries}
