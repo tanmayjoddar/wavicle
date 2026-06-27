@@ -25,6 +25,10 @@ func (h Hash) IsZero() bool {
 	return h == Hash{}
 }
 
+func (h Hash) FastHash() uint64 {
+	return binary.LittleEndian.Uint64(h[:8])
+}
+
 // Domain categorizes atoms for sharding and policy routing
 type Domain uint8
 
