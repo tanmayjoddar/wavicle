@@ -55,6 +55,11 @@ func ComposeProof(store storage.Store, path string, mode core.ObservationMode) (
 	proof.Value = val
 	proof.ValueHash = core.HashValue(val)
 
+	// Compute Merkle root so FastPath2 is armed for the first read
+	if proof.RootNode != nil {
+		proof.RootNode.ComputeMerkleRoot()
+	}
+
 	return proof, nil
 }
 
@@ -75,13 +80,18 @@ func buildProofNode(store storage.Store, path string, parent *ProofNode, pathInd
 	// Recursive construction based on expression type
 	switch e := atom.Expr.(type) {
 	case *core.ECompose:
-		node.Children = make([]*ProofNode, len(e.Atoms))
-		for i, h := range e.Atoms {
-			// Find the path for this atom hash
+		if len(e.Atoms) == 0 {
+			break
+		}
+		children := make([]*ProofNode, 0, len(e.Atoms))
+		for _, h := range e.Atoms {
 			if childAtom, ok := store.GetAtom(h); ok {
-				node.Children[i] = buildProofNode(store, childAtom.Path, node, pathIndex)
+				if child := buildProofNode(store, childAtom.Path, node, pathIndex); child != nil {
+					children = append(children, child)
+				}
 			}
 		}
+		node.Children = children
 	}
 
 	return node
