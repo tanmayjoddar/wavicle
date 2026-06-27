@@ -51,13 +51,6 @@ func ReduceIncremental(
 		return proof.Value, nil
 	}
 
-	// FAST PATH 2: Root node still valid — O(1) tree-level shortcut
-	if proof.RootNode != nil && proof.RootNode.MerkleValid && !proof.RootNode.Dirty {
-		proof.AccessCount++
-		proof.LastVerifiedAt = time.Now().UnixNano()
-		return proof.Value, nil
-	}
-
 	// INCREMENTAL PATH — find which paths changed, zero-alloc
 	var changedBuf [64]string
 	changedPathsList := local.FindChangedPaths(proof.VersionVector.Entries, changedBuf[:0])
@@ -93,9 +86,11 @@ func ReduceIncremental(
 			proof.VersionVector.Entries[path] = h
 		}
 	}
-	// ProofNode tree is now fully reduced — all dirty flags are cleared.
-	// FastPath2 will check RootNode.MerkleValid on the next read.
-	
+	// Compute Merkle root on clean tree so FastPath2 fires next read
+	if proof.RootNode != nil {
+		proof.RootNode.ComputeMerkleRoot()
+	}
+
 	proof.LastVerifiedAt = time.Now().UnixNano()
 	proof.AccessCount++
 	proof.ReduceStats.DurationNanos = time.Since(start).Nanoseconds()
@@ -147,44 +142,58 @@ func reduceDirty(node *ProofNode, local storage.Store, proof *MaterializedProof)
 		children := node.Children
 		n := len(children)
 		record := make(core.VRecord, n)
-		// Unroll common small sizes to reduce loop overhead
 		switch n {
 		case 0:
 		case 1:
-			subVal, err := reduceDirty(children[0], local, proof)
-			if err != nil {
-				return nil, err
+			if children[0] != nil {
+				subVal, err := reduceDirty(children[0], local, proof)
+				if err != nil {
+					return nil, err
+				}
+				record[children[0].SourcePath] = subVal
 			}
-			record[children[0].SourcePath] = subVal
 		case 2:
-			subVal0, err := reduceDirty(children[0], local, proof)
-			if err != nil {
-				return nil, err
+			if children[0] != nil {
+				subVal0, err := reduceDirty(children[0], local, proof)
+				if err != nil {
+					return nil, err
+				}
+				record[children[0].SourcePath] = subVal0
 			}
-			subVal1, err := reduceDirty(children[1], local, proof)
-			if err != nil {
-				return nil, err
+			if children[1] != nil {
+				subVal1, err := reduceDirty(children[1], local, proof)
+				if err != nil {
+					return nil, err
+				}
+				record[children[1].SourcePath] = subVal1
 			}
-			record[children[0].SourcePath] = subVal0
-			record[children[1].SourcePath] = subVal1
 		case 3:
-			subVal0, err := reduceDirty(children[0], local, proof)
-			if err != nil {
-				return nil, err
+			if children[0] != nil {
+				subVal0, err := reduceDirty(children[0], local, proof)
+				if err != nil {
+					return nil, err
+				}
+				record[children[0].SourcePath] = subVal0
 			}
-			subVal1, err := reduceDirty(children[1], local, proof)
-			if err != nil {
-				return nil, err
+			if children[1] != nil {
+				subVal1, err := reduceDirty(children[1], local, proof)
+				if err != nil {
+					return nil, err
+				}
+				record[children[1].SourcePath] = subVal1
 			}
-			subVal2, err := reduceDirty(children[2], local, proof)
-			if err != nil {
-				return nil, err
+			if children[2] != nil {
+				subVal2, err := reduceDirty(children[2], local, proof)
+				if err != nil {
+					return nil, err
+				}
+				record[children[2].SourcePath] = subVal2
 			}
-			record[children[0].SourcePath] = subVal0
-			record[children[1].SourcePath] = subVal1
-			record[children[2].SourcePath] = subVal2
 		default:
 			for _, childNode := range children {
+				if childNode == nil {
+					continue
+				}
 				subVal, err := reduceDirty(childNode, local, proof)
 				if err != nil {
 					return nil, err
