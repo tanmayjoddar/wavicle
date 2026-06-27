@@ -9,6 +9,71 @@ import (
 	"wavicle/internal/storage"
 )
 
+// TestIncrementalCorrectness_PoisonWrite_FrontierCache proves zero stale reads
+// using FrontierCache (production backend). Same scenario as CausalCrystal version.
+func TestIncrementalCorrectness_PoisonWrite_FrontierCache(t *testing.T) {
+	store := storage.NewFrontierCache()
+	defer store.Close()
+
+	// Seed 50 fields, compose them
+	var atoms []core.Hash
+	for i := 0; i < 50; i++ {
+		path := fmt.Sprintf("user:123:field_%d", i)
+		h, err := store.AppendAtom(
+			core.NewEConst(core.VString(fmt.Sprintf("value_%d", i))),
+			path, nil, time.Time{},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		atoms = append(atoms, h)
+	}
+
+	// Compose proof (simulates a composite cache entry)
+	composePath := "user:123"
+	store.AppendAtom(core.NewECompose(atoms), composePath, atoms, time.Time{})
+
+	proof, err := ComposeProof(store, composePath, core.ModeDeductive)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Poison write — external update changes field_5
+	poisonPath := "user:123:field_5"
+	store.AppendAtom(
+		core.NewEConst(core.VString("POISONED")),
+		poisonPath, nil, time.Time{},
+	)
+
+	// Incremental read — must return "POISONED", NOT "value_5"
+	result, err := ReduceIncremental(proof, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, ok := result.(core.VRecord)
+	if !ok {
+		t.Fatalf("expected VRecord, got %T", result)
+	}
+
+	checkPath := "user:123:field_5"
+	if v, ok := rec[checkPath]; !ok {
+		t.Fatalf("%s missing from result", checkPath)
+	} else if v != core.VString("POISONED") {
+		t.Fatalf("STALE READ on FrontierCache: %s = %v, expected POISONED", checkPath, v)
+	}
+
+	// Verify stats: 49 cache hits, 2 misses (leaf + its compose path),
+	// 1 changed path (only field_5)
+	if proof.ReduceStats.CacheHits != 49 {
+		t.Fatalf("expected 49 cache hits, got %d (misses=%d, changed=%d)",
+			proof.ReduceStats.CacheHits, proof.ReduceStats.CacheMisses, proof.ReduceStats.ChangedPaths)
+	}
+	if proof.ReduceStats.ChangedPaths != 1 {
+		t.Fatalf("expected 1 changed path, got %d", proof.ReduceStats.ChangedPaths)
+	}
+}
+
 func TestIncrementalCorrectness_PoisonWrite(t *testing.T) {
 	// This test proves that incremental reduction NEVER returns stale values.
 	crystal, err := storage.NewCausalCrystal(filepath.Join(t.TempDir(), "test_poison.log"))
