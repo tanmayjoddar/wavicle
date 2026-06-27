@@ -82,10 +82,14 @@ func (c *CausalCrystal) sweepExpired() {
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
+		expired := make(map[string]core.Hash)
 		for _, path := range c.frontier.Paths() {
 			if atom, ok := c.GetCurrent(path); ok && !atom.ExpiresAt.IsZero() && atom.ExpiresAt.Before(now) {
-				c.AppendAtom(&core.EConst{Value: core.VNull{}}, path, []core.Hash{atom.Hash}, time.Time{})
+				expired[path] = atom.Hash
 			}
+		}
+		for path, hash := range expired {
+			c.AppendAtom(&core.EConst{Value: core.VNull{}}, path, []core.Hash{hash}, time.Time{})
 		}
 	}
 }
@@ -402,7 +406,6 @@ func (c *CausalCrystal) evictIfNeeded() {
 		}
 	}
 
-	// Evict oldest 10% not in frontier
 	target := int(float64(count) * 0.1)
 	evicted := 0
 
@@ -412,6 +415,10 @@ func (c *CausalCrystal) evictIfNeeded() {
 		}
 		hash := k.(core.Hash)
 		if !frontierHashes[hash] {
+			atom := v.(*core.CausalAtom)
+			if h, ok := c.frontier.Get(atom.Path); ok && h == hash {
+				return true
+			}
 			c.atomCache.Delete(k)
 			c.atomCount.Add(-1)
 			c.parentIndex.Delete(hash)
