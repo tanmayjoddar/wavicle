@@ -34,8 +34,13 @@ func NewProofCache(shards int, capacityPerShard int) *ProofCache {
 	return &ProofCache{shards: sc}
 }
 
+func (pc *ProofCache) shard(key core.Hash) *cacheShard {
+	h := key.FastHash()
+	return pc.shards[int(h%uint64(len(pc.shards)))]
+}
+
 func (pc *ProofCache) Get(key core.Hash) (*MaterializedProof, bool) {
-	s := pc.shards[int(key[0])%len(pc.shards)]
+	s := pc.shard(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -47,7 +52,7 @@ func (pc *ProofCache) Get(key core.Hash) (*MaterializedProof, bool) {
 }
 
 func (pc *ProofCache) Set(key core.Hash, proof *MaterializedProof) {
-	s := pc.shards[int(key[0])%len(pc.shards)]
+	s := pc.shard(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -70,7 +75,7 @@ func (pc *ProofCache) Set(key core.Hash, proof *MaterializedProof) {
 }
 
 func (pc *ProofCache) Delete(key core.Hash) {
-	s := pc.shards[int(key[0])%len(pc.shards)]
+	s := pc.shard(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
