@@ -87,9 +87,6 @@ func TestPostgres_Hardcore_EndToEnd(t *testing.T) {
 	defer db.Close()
 
 	testSlot := fmt.Sprintf("wavicle_slot_%d", time.Now().UnixNano()%10000000)
-	defer func() {
-		_, _ = db.Exec("SELECT pg_drop_replication_slot($1)", testSlot)
-	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -110,7 +107,16 @@ func TestPostgres_Hardcore_EndToEnd(t *testing.T) {
 		ReplicationSlot: testSlot,
 		Publication:     testPubName,
 	})
-	defer pgListener.Close()
+	defer func() {
+		_ = pgListener.Close()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := db.Exec("SELECT pg_drop_replication_slot($1)", testSlot); err == nil {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}()
 
 	events, err := pgListener.Start(ctx)
 	if err != nil {

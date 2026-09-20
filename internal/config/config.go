@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,9 +31,10 @@ type ServerConfig struct {
 }
 
 type StorageConfig struct {
-	DataDir     string `yaml:"data_dir"`
-	Engine      string `yaml:"engine"` // "crystal" or "postgres" or "mysql"
-	MaxFrontier int    `yaml:"max_frontier"`
+	DataDir        string `yaml:"data_dir"`
+	Engine         string `yaml:"engine"` // "crystal" or "postgres" or "mysql"
+	MaxFrontier    int    `yaml:"max_frontier"`
+	MaxMemoryBytes int64  `yaml:"max_memory_bytes"`
 }
 
 type EngineConfig struct {
@@ -78,9 +80,10 @@ func Default() *Config {
 			WriteTimeout: 5 * time.Second,
 		},
 		Storage: StorageConfig{
-			DataDir:     "data",
-			Engine:      "crystal",
-			MaxFrontier: 10000000,
+			DataDir:        "data",
+			Engine:         "crystal",
+			MaxFrontier:    10000000,
+			MaxMemoryBytes: 4 * 1024 * 1024 * 1024, // 4GB default
 		},
 		Engine: EngineConfig{
 			ProofCache: ProofCacheConfig{
@@ -123,6 +126,11 @@ func (c *Config) LoadFromEnv() {
 	if v := os.Getenv("WAVICLE_STORAGE_DATA_DIR"); v != "" {
 		c.Storage.DataDir = v
 	}
+	if v := os.Getenv("WAVICLE_MAX_MEMORY"); v != "" {
+		if bytes, err := ParseBytes(v); err == nil {
+			c.Storage.MaxMemoryBytes = bytes
+		}
+	}
 	if v := os.Getenv("WAVICLE_DB_TYPE"); v != "" {
 		c.DB.Type = v
 	}
@@ -154,6 +162,37 @@ func (c *Config) LoadFromEnv() {
 			c.Engine.ProofCache.MaxEntries = i
 		}
 	}
+}
+
+// ParseBytes parses a human-readable byte string (e.g., "500MB", "4GB", "1024KB", "1048576").
+func ParseBytes(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 0, fmt.Errorf("empty byte string")
+	}
+	multiplier := int64(1)
+	valStr := s
+	if strings.HasSuffix(s, "TB") || strings.HasSuffix(s, "T") {
+		multiplier = 1024 * 1024 * 1024 * 1024
+		valStr = strings.TrimRight(s, "TB")
+	} else if strings.HasSuffix(s, "GB") || strings.HasSuffix(s, "G") {
+		multiplier = 1024 * 1024 * 1024
+		valStr = strings.TrimRight(s, "GB")
+	} else if strings.HasSuffix(s, "MB") || strings.HasSuffix(s, "M") {
+		multiplier = 1024 * 1024
+		valStr = strings.TrimRight(s, "MB")
+	} else if strings.HasSuffix(s, "KB") || strings.HasSuffix(s, "K") {
+		multiplier = 1024
+		valStr = strings.TrimRight(s, "KB")
+	} else if strings.HasSuffix(s, "B") {
+		valStr = strings.TrimRight(s, "B")
+	}
+	valStr = strings.TrimSpace(valStr)
+	val, err := strconv.ParseInt(valStr, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return val * multiplier, nil
 }
 
 func (c *Config) Validate() error {

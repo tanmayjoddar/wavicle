@@ -185,19 +185,46 @@ If any hash mismatches:
 
 ## 6. PostgreSQL Change Data Capture & Replication Pipeline
 
-To capture writes originating outside of Wavicle (e.g., DBA updates, batch jobs):
+To capture writes originating outside of Wavicle (e.g., DBA updates, batch jobs, direct SQL mutations):
 
 1. **Replication Protocol:** `PGListener` initiates a streaming connection to PostgreSQL using `github.com/jackc/pglogrepl` with the standard `pgoutput` plugin.
-2. **Heartbeats & Standby Status:** The background consumer thread emits periodic standby status messages to PostgreSQL to update the confirmed flushed LSN and prevent replication slot unbounded WAL retention.
-3. **Tuple Decoding:** Relation metadata messages (`*pglogrepl.RelationMessage`) are cached in memory. Inbound insert/update/delete tuple messages decode column values according to configured `TableMappings`.
-4. **Echo Suppression Guard:** When Wavicle issues a write-through `SET`, it writes to PostgreSQL and appends the atom locally. Seconds later, PostgreSQL streams the same event over CDC. To prevent invalidating the proof cache unnecessarily, the CDC listener checks:
+2. **LSN Checkpointing & Crash Recovery:**
+   - The consumer tracks `lastLSN` and regularly checkpoints it to disk (`replication_checkpoint.lsn`).
+   - Every status update and keepalive response transmits `WALWritePosition`, `WALFlushPosition`, and `WALApplyPosition` back to PostgreSQL.
+   - This advances `confirmed_flush_lsn` in PostgreSQL, allowing PostgreSQL to safely recycle WAL logs on disk.
+   - Upon process crash or restart, Wavicle reads the disk checkpoint and resumes replication from the exact byte offset without re-processing already-applied records or missing offline backlog mutations.
+3. **Reconnection with Exponential Backoff:** If PostgreSQL restarts or primary failover occurs, `PGListener` enters an exponential backoff reconnect loop (1s to 30s) and increments `wavicle_db_reconnects_total`.
+4. **Tuple Decoding:** Relation metadata messages (`*pglogrepl.RelationMessage`) are cached in memory. Inbound insert/update/delete tuple messages decode column values according to configured `TableMappings`.
+5. **Echo Suppression Guard:** When Wavicle issues a write-through `SET`, it writes to PostgreSQL and appends the atom locally. Seconds later, PostgreSQL streams the same event over CDC. To prevent invalidating the proof cache unnecessarily, the CDC listener checks:
    - Is `CommitTime <= currentAtom.PhysicalTime`? If so, discard.
    - Does the decoded column string equal `currentAtom.Expr`? If so, discard.
 
 ---
 
-## 7. Concrete Operational Boundaries & Limitations
+## 7. Memory Safety & Configurable LRU Eviction
 
-1. **Protocol Features:** Supports Key-Value and Hash commands (`GET`, `SET`, `MGET`, `MSET`, `HGET`, `HSET`, `HGETALL`, `DEL`, `EXPIRE`, `TTL`, `EXISTS`, `DBSIZE`, `PING`, `AUTH`). It does **not** support Redis Lists, Sets, Sorted Sets (`ZSET`), Transactions (`MULTI`/`EXEC`), or Pub/Sub.
-2. **SQL Parser:** The built-in SQL parser is a specialized projection parser for `SELECT col FROM table WHERE id = X`. It is not an arbitrary SQL planner.
-3. **Memory Limits:** Expired keys are collected via a 60s background sweep. Global LRU eviction under unexpired key exhaustion (`maxmemory`) is scheduled for subsequent versions.
+To prevent out-of-memory (OOM) fatal crashes during prolonged high-throughput ingestion:
+
+1. **Configurable Ceiling:** The memory ceiling is configured via environment variable `WAVICLE_MAX_MEMORY` (e.g., `500MB`, `2GB`, `4GB`, default: 4GB).
+2. **Byte-Accurate Accounting:** Every entry in `FrontierCache` tracks its estimated byte weight (atom struct + map bucket + LRU element + payload string/bytes).
+3. **High-Watermark LRU Eviction:**
+   - Eviction is triggered when memory usage crosses **90%** of `maxMemoryBytes`.
+   - The eviction loop purges least-recently-used entries from the tail of an intrusive doubly-linked list (`container/list`) until memory drops to **<= 80%**.
+   - Draining to 80% prevents per-write eviction churn ("ping-ponging").
+   - Evictions increment `wavicle_memory_evictions_total` and update `wavicle_memory_bytes`.
+4. **Transparent Read-Through Fallback:**
+   - Evicted keys are NOT permanently lost. Because `WriteThroughStore` wraps PostgreSQL as the source of truth, an evicted key queried via `GET` incurs a single PostgreSQL query fallback, seamlessly re-populating `FrontierCache`.
+
+---
+
+## 8. Concrete Operational Boundaries & Production Realities
+
+1. **Network Latency Model (Loopback vs. Real Network):**
+   - On `localhost`, CDC replication lag registers at **~12ms** because OS page cache and loopback sockets eliminate transport delay.
+   - In cross-AZ cloud VPCs (e.g., AWS EC2 to RDS), expected end-to-end CDC propagation lag is **25ms – 80ms** (due to network RTT, EBS disk flush, WAL sender serialization, and queueing). **Loopback metrics must never be quoted as production WAN latencies.**
+2. **Replication Slot Hygiene:**
+   - PostgreSQL does not recycle WAL for inactive replication slots. If a consumer drops offline permanently, PostgreSQL disk usage will grow until disk exhaustion.
+   - In test and production, all ephemeral slots must be cleanly destroyed via `SELECT pg_drop_replication_slot()`.
+3. **Protocol Scope:** Supports Key-Value and Hash commands (`GET`, `SET`, `MGET`, `MSET`, `HGET`, `HSET`, `HGETALL`, `DEL`, `EXPIRE`, `TTL`, `EXISTS`, `DBSIZE`, `PING`, `AUTH`). It does **not** support Redis Lists, Sets, Sorted Sets (`ZSET`), Transactions (`MULTI`/`EXEC`), or Pub/Sub.
+4. **SQL Parser Scope:** The built-in SQL parser is a specialized projection parser for `SELECT col FROM table WHERE id = X`. It is not an arbitrary relational query optimizer for multi-table joins.
+

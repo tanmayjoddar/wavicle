@@ -1,0 +1,46 @@
+groups:
+  - name: wavicle_replication_alerts
+    rules:
+      # Alert when CDC replication lag from PostgreSQL exceeds 500ms
+      - alert: WavicleHighReplicationLag
+        expr: wavicle_replication_lag_ms > 500
+        for: 1m
+        labels:
+          severity: critical
+          service: wavicle-cache
+        annotations:
+          summary: "Wavicle replication lag exceeds 500ms on table {{ $labels.table }}"
+          description: "Wavicle is lagging behind PostgreSQL WAL commit time by {{ $value }}ms. Stale read risk elevated."
+
+      # Alert when the logical replication slot accumulates > 2GB of unconsumed WAL on disk
+      - alert: WavicleReplicationSlotDiskGrowth
+        expr: wavicle_replication_slot_bytes > 2147483648
+        for: 5m
+        labels:
+          severity: warning
+          service: wavicle-cache
+        annotations:
+          summary: "PostgreSQL replication slot disk size exceeds 2GB"
+          description: "Replication slot is holding {{ $value | humanizeBytes }} on Postgres disk. Risk of PostgreSQL disk exhaustion if consumer stalls."
+
+      # Alert when cache memory pressure reaches or exceeds 90%
+      - alert: WavicleHighMemoryPressure
+        expr: (wavicle_memory_bytes / wavicle_memory_limit_bytes) >= 0.90
+        for: 2m
+        labels:
+          severity: warning
+          service: wavicle-cache
+        annotations:
+          summary: "Wavicle memory pressure at {{ $value | humanizePercentage }}"
+          description: "In-memory FrontierCache is near its ceiling. LRU evictions are active."
+
+      # Alert when PostgreSQL replication connection drops and enters reconnect backoff
+      - alert: WaviclePostgresDisconnected
+        expr: rate(wavicle_db_reconnects_total[1m]) > 0
+        for: 30s
+        labels:
+          severity: critical
+          service: wavicle-cache
+        annotations:
+          summary: "Wavicle disconnected from PostgreSQL WAL replication"
+          description: "Connection to Postgres lost; replication listener is in exponential backoff reconnect loop."

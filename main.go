@@ -57,6 +57,7 @@ func main() {
 			ReplicationSlot: cfg.DB.ReplicationSlot,
 			Publication:     cfg.DB.Publication,
 			TableMappings:   mapConfigToMappers(cfg.DB.TableMappings),
+			CheckpointPath:  filepath.Join(cfg.Storage.DataDir, "replication_checkpoint.lsn"),
 		})
 
 		events, err := pgListener.Start(ctx)

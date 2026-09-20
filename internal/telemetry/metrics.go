@@ -6,6 +6,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // Metrics holds the official Prometheus metrics for Wavicle.
@@ -25,8 +26,14 @@ type Metrics struct {
 	AtomCount            prometheus.Gauge // Renamed from FrontierCacheEntries for consistency
 	TTLEvictionsTotal    prometheus.Counter
 
+	// Memory Management
+	MemoryUsedBytes      prometheus.Gauge
+	MemoryLimitBytes     prometheus.Gauge
+	MemoryEvictionsTotal prometheus.Counter
+
 	// Replication
-	ReplicationLagMs *prometheus.GaugeVec
+	ReplicationLagMs     *prometheus.GaugeVec
+	ReplicationSlotBytes prometheus.Gauge
 
 	// Registry
 	Registry *prometheus.Registry
@@ -100,6 +107,26 @@ func init() {
 		Help: "Current replication lag from external DB in milliseconds.",
 	}, []string{"table"})
 
+	m.MemoryUsedBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "wavicle_memory_bytes",
+		Help: "Estimated memory usage of the in-memory cache in bytes.",
+	})
+
+	m.MemoryLimitBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "wavicle_memory_limit_bytes",
+		Help: "Configured maximum memory ceiling for the cache in bytes.",
+	})
+
+	m.MemoryEvictionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "wavicle_memory_evictions_total",
+		Help: "Total number of items evicted due to memory pressure.",
+	})
+
+	m.ReplicationSlotBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "wavicle_replication_slot_bytes",
+		Help: "Disk bytes consumed by PostgreSQL replication slot.",
+	})
+
 	// Register all metrics
 	m.Registry.MustRegister(
 		m.RequestsTotal,
@@ -113,7 +140,11 @@ func init() {
 		m.DBReconnectsTotal,
 		m.AtomCount,
 		m.TTLEvictionsTotal,
+		m.MemoryUsedBytes,
+		m.MemoryLimitBytes,
+		m.MemoryEvictionsTotal,
 		m.ReplicationLagMs,
+		m.ReplicationSlotBytes,
 	)
 
 	global = m
@@ -147,6 +178,19 @@ func (m *Metrics) RecordTTLEviction() {
 	m.TTLEvictionsTotal.Inc()
 }
 
+func (m *Metrics) RecordMemoryUsage(used, limit int64) {
+	m.MemoryUsedBytes.Set(float64(used))
+	m.MemoryLimitBytes.Set(float64(limit))
+}
+
+func (m *Metrics) RecordMemoryEviction() {
+	m.MemoryEvictionsTotal.Inc()
+}
+
+func (m *Metrics) RecordSlotBytes(bytes int64) {
+	m.ReplicationSlotBytes.Set(float64(bytes))
+}
+
 func (m *Metrics) RecordError() {
 	m.ErrorsTotal.Inc()
 }
@@ -174,6 +218,22 @@ func (m *Metrics) RecordAtomCount(count int64) {
 func (m *Metrics) RecordReplicationLag(table string, commitTime time.Time) {
 	lag := time.Since(commitTime).Milliseconds()
 	m.ReplicationLagMs.WithLabelValues(table).Set(float64(lag))
+}
+
+func (m *Metrics) GetMemoryEvictions() float64 {
+	var metric dto.Metric
+	if err := m.MemoryEvictionsTotal.Write(&metric); err == nil && metric.Counter != nil {
+		return metric.Counter.GetValue()
+	}
+	return 0
+}
+
+func (m *Metrics) GetTTLEvictions() float64 {
+	var metric dto.Metric
+	if err := m.TTLEvictionsTotal.Write(&metric); err == nil && metric.Counter != nil {
+		return metric.Counter.GetValue()
+	}
+	return 0
 }
 
 func ListenAndServe(addr string) error {

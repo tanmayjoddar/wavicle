@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +15,8 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"wavicle/internal/telemetry"
 )
 
 const (
@@ -27,6 +31,7 @@ type PGConfig struct {
 	ReplicationSlot string
 	Publication     string
 	TableMappings   []PathMapper
+	CheckpointPath  string
 }
 
 // PGListener consumes PostgreSQL logical replication events.
@@ -61,17 +66,82 @@ func (l *PGListener) Start(ctx context.Context) (<-chan ChangeEvent, error) {
 	return l.events, nil
 }
 
+func (l *PGListener) IsRunning() bool {
+	return l.running.Load()
+}
+
+func (l *PGListener) WaitReady(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if l.running.Load() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
 func (l *PGListener) Close() error {
 	if l.cancel != nil {
 		l.cancel()
 	}
 	l.mu.Lock()
-	if l.conn != nil {
+	lsn := l.lastLSN
+	if l.conn != nil && lsn > 0 {
+		_ = pglogrepl.SendStandbyStatusUpdate(context.Background(), l.conn,
+			pglogrepl.StandbyStatusUpdate{
+				WALWritePosition: lsn,
+				WALFlushPosition: lsn,
+				WALApplyPosition: lsn,
+			})
 		l.conn.Close(context.Background())
 		l.conn = nil
 	}
 	l.mu.Unlock()
+	l.saveCheckpoint(lsn)
 	return nil
+}
+
+func (l *PGListener) saveCheckpoint(lsn pglogrepl.LSN) {
+	if l.config.CheckpointPath == "" || lsn == 0 {
+		return
+	}
+	tmp := l.config.CheckpointPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(lsn.String()), 0644); err == nil {
+		_ = os.Rename(tmp, l.config.CheckpointPath)
+	}
+}
+
+func (l *PGListener) loadCheckpoint() pglogrepl.LSN {
+	if l.config.CheckpointPath == "" {
+		return 0
+	}
+	data, err := os.ReadFile(l.config.CheckpointPath)
+	if err != nil {
+		return 0
+	}
+	lsn, err := pglogrepl.ParseLSN(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0
+	}
+	return lsn
+}
+
+func (l *PGListener) sendStatusUpdate(ctx context.Context, conn *pgconn.PgConn) error {
+	lsn := l.getLastLSN()
+	if lsn == 0 {
+		return nil
+	}
+	err := pglogrepl.SendStandbyStatusUpdate(ctx, conn,
+		pglogrepl.StandbyStatusUpdate{
+			WALWritePosition: lsn,
+			WALFlushPosition: lsn,
+			WALApplyPosition: lsn,
+		})
+	if err == nil {
+		l.saveCheckpoint(lsn)
+	}
+	return err
 }
 
 func (l *PGListener) run(ctx context.Context) {
@@ -87,6 +157,7 @@ func (l *PGListener) run(ctx context.Context) {
 
 		if err := l.connectAndConsume(ctx); err != nil {
 			l.running.Store(false)
+			telemetry.Get().RecordDBReconnect()
 			log.Printf("[replication] PostgreSQL connection error: %v. Retrying in %v...", err, backoff)
 			select {
 			case <-ctx.Done():
@@ -142,10 +213,17 @@ func (l *PGListener) connectAndConsume(ctx context.Context) error {
 	_, _ = pglogrepl.CreateReplicationSlot(ctx, conn, slotName, "pgoutput",
 		pglogrepl.CreateReplicationSlotOptions{Temporary: false})
 
-	// Start replication from last known position (0 = earliest available)
-	// Tracking and sending lastLSN in StandbyStatusUpdate prevents PG from
-	// resending already-processed WAL on reconnect, avoiding duplicate atoms.
+	// Start replication from last known position (or disk checkpoint)
 	startLSN := l.getLastLSN()
+	if startLSN == 0 {
+		startLSN = l.loadCheckpoint()
+		if startLSN > 0 {
+			l.mu.Lock()
+			l.lastLSN = startLSN
+			l.mu.Unlock()
+			log.Printf("[replication] Resumed replication from checkpoint LSN %s", startLSN)
+		}
+	}
 	err = pglogrepl.StartReplication(ctx, conn, slotName, startLSN,
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{
@@ -168,8 +246,7 @@ func (l *PGListener) connectAndConsume(ctx context.Context) error {
 		}
 
 		if time.Since(lastKeepalive) > keepalivePeriod {
-			pglogrepl.SendStandbyStatusUpdate(ctx, conn,
-				pglogrepl.StandbyStatusUpdate{WALWritePosition: l.getLastLSN()})
+			_ = l.sendStatusUpdate(ctx, conn)
 			lastKeepalive = time.Now()
 		}
 
@@ -178,8 +255,7 @@ func (l *PGListener) connectAndConsume(ctx context.Context) error {
 		cancel()
 		if err != nil {
 			if pgconn.Timeout(err) {
-				pglogrepl.SendStandbyStatusUpdate(ctx, conn,
-					pglogrepl.StandbyStatusUpdate{WALWritePosition: l.getLastLSN()})
+				_ = l.sendStatusUpdate(ctx, conn)
 				lastKeepalive = time.Now()
 				continue
 			}
@@ -226,8 +302,7 @@ func (l *PGListener) handleCopyData(ctx context.Context, conn *pgconn.PgConn, da
 			return fmt.Errorf("parse keepalive: %w", err)
 		}
 		if pkm.ReplyRequested {
-			pglogrepl.SendStandbyStatusUpdate(ctx, conn,
-				pglogrepl.StandbyStatusUpdate{WALWritePosition: l.getLastLSN()})
+			_ = l.sendStatusUpdate(ctx, conn)
 		}
 		return nil
 
@@ -462,4 +537,48 @@ SELECT pg_create_logical_replication_slot('wavicle_slot', 'pgoutput');
 SELECT slot_name, active FROM pg_replication_slots WHERE slot_name = 'wavicle_slot';
 SELECT pub_name FROM pg_publication WHERE pub_name = 'wavicle_proofs';
 `
+}
+
+// SlotInfo holds replication slot statistics from PostgreSQL.
+type SlotInfo struct {
+	SlotName string
+	Active   bool
+	LagBytes int64
+}
+
+// QuerySlotInfo queries pg_replication_slots for active status and WAL lag.
+func QuerySlotInfo(ctx context.Context, dsn string, slotName string) (*SlotInfo, error) {
+	conn, err := pgconn.Connect(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close(ctx)
+
+	query := fmt.Sprintf(`
+		SELECT slot_name, active,
+		       COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)::bigint AS lag_bytes
+		FROM pg_replication_slots
+		WHERE slot_name = '%s';
+	`, strings.ReplaceAll(slotName, "'", "''"))
+
+	mrr := conn.Exec(ctx, query)
+	results, err := mrr.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	for _, result := range results {
+		for _, row := range result.Rows {
+			if len(row) >= 3 {
+				info := &SlotInfo{
+					SlotName: string(row[0]),
+					Active:   string(row[1]) == "t",
+				}
+				if lag, err := strconv.ParseInt(string(row[2]), 10, 64); err == nil {
+					info.LagBytes = lag
+				}
+				return info, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("slot %s not found", slotName)
 }
