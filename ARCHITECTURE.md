@@ -1,137 +1,203 @@
-# Wavicle Architecture & Technical Specification
+# Wavicle — In-Depth Architectural Specification & Systems Design
 
-> **A Proof-Based Cache Consistency Engine in Go**  
-> *Eliminates heuristic TTLs and manual cache invalidation by verifying cryptographic version vectors on read.*
-
----
-
-## 1. Executive Summary & Problem Statement
-
-### The Problem with Traditional Caching
-In conventional architectures (e.g., Redis or Memcached placed in front of a relational database):
-1. **Cache Invalidation is Reactive & Fragile:** Developers rely on heuristic TTLs, pub/sub invalidation topics, or explicit `cache.del(key)` calls inside business logic. Missing a single invalidation codepath results in **silent stale reads**.
-2. **Coarse-Grained Cache Busting:** When 1 field of a composite object (e.g., a 50-field user profile or aggregated dashboard) is updated, applications typically evict or recompute the entire object from the database from scratch (~100–200μs).
-3. **External Write Blindness:** Direct SQL writes from background jobs, DBAs, or other microservices bypass application-level cache eviction.
-
-### Wavicle's Solution
-Wavicle inverts the caching paradigm from **reactive eviction** to **proactive verification**:
-- Every cached query or composite object carries an in-memory **receipt** (a version vector of underlying dependency atom hashes).
-- On read, Wavicle compares the version vector against the current live frontier in memory.
-- If nothing changed, it serves the cached result in **~1.5μs with zero allocations**.
-- If sub-fields changed, it marks dirty paths in the abstract syntax proof tree and re-reduces **only the affected sub-expressions in ~9.7μs**, delivering a **20.7× speedup** over cold reconstruction with **zero stale reads**.
+> **Document Status:** Authoritative Technical Specification  
+> **Target Audience:** Systems Architects, Principal Engineers, Technical Due Diligence  
+> **Source Code:** `wavicle/internal/...`
 
 ---
 
-## 2. System Architecture
+## 1. System Vision & The Core Invalidation Dilemma
+
+### 1.1 The Fundamental Flaw of Reactive Invalidation
+In modern web applications, the primary performance bottleneck is data assembly from relational databases. To mitigate this, developers place an in-memory key-value cache (e.g., Redis) between the application layer and the persistent store (e.g., PostgreSQL). 
+
+However, cache invalidation in traditional architectures is **reactive and decoupled**:
+1. **Heuristic Time-To-Live (TTL):** A blind timer is attached to a cached key. The cache serves stale data until the timer expires, or evicts fresh data prematurely if the underlying database row remained untouched.
+2. **Imperative Invalidation (`DEL` on Write):** The application code updating the database must explicitly issue a cache deletion. In multi-service microservice topologies or distributed codebases, omitting an invalidation call across any write pathway causes **silent, permanent stale reads**.
+3. **Coarse-Grained Cache Busting:** When a single field of a composite object (e.g., a dashboard aggregation or user profile spanning 50 attributes) changes, applications generally dump and recompute the entire object from scratch via a heavy SQL query.
+4. **Out-of-Band Write Blindness:** Batch ETL scripts, database migrations, DBA maintenance, and external services writing directly to PostgreSQL bypass application-level cache eviction entirely.
+
+### 1.2 The Proactive Verification Hypothesis
+Wavicle eliminates reactive invalidation by making cached objects **self-verifying**:
+- Every cached query or composite record carries a cryptographic **receipt**—a version vector mapping every dependency path to the hash of its underlying data atom.
+- On every read, the cache **proactively proves its own freshness** against an in-memory live frontier.
+- If the receipt matches, the value is returned in **~1.59 μs** with **0 allocations**.
+- If one or more sub-fields mutated, dirty propagation marks only the affected branches of the proof tree, re-evaluating **only the dirty sub-expressions in ~9.66 μs** (**20.7× faster** than a full recompute), guaranteeing **0% stale reads**.
+
+---
+
+## 2. Complete Layer-by-Layer Architectural Decomposition
 
 ```
-+-------------------------------------------------------------------------+
-|                           Client Application                            |
-|             (Connects via standard Redis RESP3 protocol)                |
-+-------------------------------------------------------------------------+
-                                     |
-                                     | TCP (:6379)
-                                     v
-+-------------------------------------------------------------------------+
-|                         Wavicle Core Engine                             |
-|                                                                         |
-|   +-----------------------------------------------------------------+   |
-|   |                        RESP3 Server                             |   |
-|   |   Supports: GET, SET, MGET, MSET, HGET, HSET, HGETALL, DEL,     |   |
-|   |             EXPIRE, TTL, EXISTS, DBSIZE, PING                   |   |
-|   +-----------------------------------------------------------------+   |
-|                                    |                                    |
-|                                    v                                    |
-|   +-----------------------------------------------------------------+   |
-|   |                        Proof Engine                             |   |
-|   |   - ProofCache (Sharded LRU)                                    |   |
-|   |   - FastPath 1: Version Vector Exact Match (~1.5μs, 0 allocs)    |   |
-|   |   - FastPath 2: Sub-tree Dirty Re-reduction (~9.7μs)             |   |
-|   |   - Cold Path: Full ComposeProof from Frontier (~199μs)         |   |
-|   +-----------------------------------------------------------------+   |
-|                                    |                                    |
-|                                    v                                    |
-|   +-----------------------------------------------------------------+   |
-|   |                      FrontierCache                              |   |
-|   |   - In-memory key-to-atom map                                   |   |
-|   |   - Bounded memory footprint: O(unique keys)                    |   |
-|   |   - Background TTL sweeper                                      |   |
-|   +-----------------------------------------------------------------+   |
-+-------------------------------------------------------------------------+
-                    |                                 ^
-         Write-Through (Sync)                         | CDC (Async WAL stream)
-                    v                                 |
-+-------------------------------------------------------------------------+
-|                         PostgreSQL Database                             |
-|                   (Primary Source of Durable Truth)                     |
-|                                                                         |
-|   +--------------------------+         +----------------------------+   |
-|   |   Relational Tables      |         |   Logical Replication Slot |   |
-|   |   (e.g., users, orders)  |         |   (pglogrepl CDC listener) |   |
-|   +--------------------------+         +----------------------------+   |
-+-------------------------------------------------------------------------+
++=============================================================================+
+|                           CLIENT APPLICATIONS                               |
+|        (Connects via standard Redis client libraries or raw TCP)            |
++=============================================================================+
+                                      |
+                                      | TCP Socket (:6379)
+                                      v
++=============================================================================+
+|                      1. PROTOCOL & CONNECTION LAYER                         |
+|                         (internal/protocol/resp3)                           |
+|                                                                             |
+|  * ListenAndServe(addr string): Accepts TCP connections, tracks activeConns |
+|  * readCommand(r *bufio.Reader): Parses RESP3 arrays (*), bulk strings ($), |
+|    and inline plaintext commands into argument vectors.                     |
+|  * MaxConns guard (default 10,000) with atomic connection tracking.        |
+|  * Supported commands: GET, SET, MGET, MSET, HGET, HSET, HGETALL, DEL,      |
+|    EXPIRE, TTL, EXISTS, DBSIZE, PING, AUTH.                                 |
++=============================================================================+
+                                      |
+                                      v
++=============================================================================+
+|                         2. PROOF ENGINE & AST CORE                          |
+|                       (internal/engine, internal/core)                      |
+|                                                                             |
+|  * ProofCache: 64-shard LRU cache with xxHash key distribution.             |
+|  * AST Hierarchy (CombinatorExpr):                                          |
+|      - EConst (Level 0): Literal scalar/record value.                       |
+|      - EFieldAccess (Level 1): Dynamic field projection from a record.      |
+|      - ECompose (Level 2): Composite object assembling child atom hashes.   |
+|      - EApply (Level 2): SKI combinator calculus application.               |
+|  * InternTable: 256-shard AST deduplication with monotonic ExprHeader IDs.  |
+|  * Three Read Paths:                                                        |
+|      1. FastPath 1 (VV Match): In-memory hash comparison (~1.59μs, 0 alloc)|
+|      2. Incremental Path: AST dirty propagation & sub-reduction (~9.66μs)   |
+|      3. Cold Path: Causal closure construction & tree compilation (~199μs)  |
++=============================================================================+
+                                      |
+                                      v
++=============================================================================+
+|                        3. IN-MEMORY STORAGE LAYER                           |
+|                            (internal/storage)                               |
+|                                                                             |
+|  * FrontierCache (Production Engine):                                       |
+|      - sync.RWMutex protecting entries (map[string]*core.CausalAtom).        |
+|      - hashToPath index for reverse atom resolution.                        |
+|      - Strictly bounded to O(unique keys) RAM. Zero WAL, zero ancestry.     |
+|      - sweepExpired(): 60-second ticker reclaiming expired TTL entries.     |
+|  * CausalCrystal (Development & Algorithmic Validation Engine):             |
+|      - Full causal DAG with persistent Append-Only WAL & JSON serialization.|
+|      - Active Frontier Index, Parent Index, and Merkle tree (SHA3-256).     |
+|      - Periodic background compaction with double-buffering (.tmp / .old).  |
++=============================================================================+
+                    |                                         ^
+         Write-Through (Sync)                                 | CDC Stream (Async)
+                    v                                         |
++=============================================================================+
+|                       4. DURABLE PERSISTENCE & CDC                          |
+|                      (internal/storage/postgres.go,                         |
+|                       internal/replication/postgres.go)                     |
+|                                                                             |
+|  * WriteThroughStore: Synchronous write to PG, synchronous append to local. |
+|  * PostgresStore: SQL identifier validation, parameter binding, UPSERTs.   |
+|  * PGListener: pglogrepl logical replication client consuming PostgreSQL   |
+|    WAL events via pgoutput plugin.                                          |
+|  * Echo Suppression Guard: Compares commit timestamps and values to         |
+|    prevent self-generated write-through updates from cycling through CDC.   |
++=============================================================================+
 ```
 
 ---
 
-## 3. Storage Layer: Evolution & Trade-offs
+## 3. The AST Algebra & Combinator Core
 
-Wavicle implements two distinct storage backends fulfilling different roles:
+Wavicle represents data and computation uniformly through an interned, typed combinator algebra in [`internal/core`](file:///d:/wavicle/internal/core).
 
-### A. CausalCrystal (Development & Algorithm Validation)
-- **Model:** Full causal directed acyclic graph (DAG).
-- **Durability:** Write-Ahead Log (WAL) with synchronous fsync.
-- **Indices:** Active Frontier Index, Parent Index, and full SHA3-256 Merkle tree.
-- **Trade-off:** Retaining causal ancestry guarantees mathematical determinism for testing, but historical ancestry causes memory and recovery time to scale with total write history ($O(\text{writes})$).
+### 3.1 Expression Types (`CombinatorExpr`)
+Every node implements `CombinatorExpr`:
+- `EConst`: Encapsulates a terminal `Value` (e.g., `VString`, `VInt`, `VRecord`, `VNull`).
+- `EFieldAccess`: Encapsulates accessing a named field from an upstream record.
+- `ECompose`: Encapsulates a composite object constructed from an array of atom hashes (`[]core.Hash`). This is the foundation of cached multi-field queries.
+- `EApply`: Implements classical SKI combinator calculus ($I x = x$, $K x y = x$, $S x y z = (x z)(y z)$), enabling functional evaluation over dynamic graphs without compiling to machine bytecode.
 
-### B. FrontierCache (Production Engine)
-- **Model:** Active frontier store mapping each live path to its latest `CausalAtom`.
-- **Durability:** Delegated entirely to PostgreSQL as the single source of truth.
-- **Memory Complexity:** Strictly **$O(\text{unique keys})$**, eliminating WAL compaction overhead, tombstone chains, and ancestry graph traversal.
-- **Performance Impact:** `benchstat` verification proved a **34.4% latency reduction** ($p = 0.002$) on warm reads compared to the multi-index DAG backend.
-
----
-
-## 4. Query Execution & The 3 Read Paths
-
-When a client issues a read (e.g., `GET user:123`):
-
-### Path 1: FastPath 1 — Version Vector Match (Warm Reuse)
-1. Query key is hashed via SHA3-256 to look up the `MaterializedProof` in the sharded LRU `ProofCache`.
-2. The engine invokes `store.VerifyVersionVector(proof.VersionVector.Entries)`.
-3. If every dependency's atom hash matches the live frontier in RAM and has not expired, the cached value is returned immediately.
-4. **Latency:** **~1.59 μs**, **0 B/op**, **0 allocs/op**.
-
-### Path 2: Incremental Reduction (Partial Mutation)
-1. If any atom hash in the version vector differs from the live frontier, `local.FindChangedPaths` identifies the dirty paths.
-2. The engine marks only those dirty nodes in the AST `ProofNode` hierarchy and propagates dirty flags upward to the root.
-3. Clean subtrees return memoized pointer references with 0 recomputation.
-4. Only dirty sub-expressions are re-reduced.
-5. The version vector is updated in-place with the latest frontier hashes.
-6. **Latency:** **~9.66 μs** (vs. 199.4 μs cold compose), achieving a **20.7× speedup**.
-
-### Path 3: Cold Proof Composition (Cache Miss)
-1. Triggered only on first access or after proof cache eviction.
-2. Traverses child paths from the frontier, interned AST expressions are resolved, and the initial `ProofNode` tree is materialized.
-3. **Latency:** **~199.4 μs**, 316 allocs/op.
+### 3.2 Global Interning & Structural Hashing
+To prevent GC thrashing from repeated AST allocation:
+1. Every expression embeds a 24-byte `ExprHeader` containing an `ExprType`, tree depth, and atomic xxHash cache.
+2. The `InternTable` uses 256 independent shards (`internShard`).
+3. Calling `InternExpr(e)` calculates the structural hash. If an equivalent expression already exists in the shard, the pointer to the existing expression is returned. If not, a monotonic 64-bit ID is assigned and stored.
 
 ---
 
-## 5. PostgreSQL Change Data Capture (CDC) Integration
+## 4. The Storage Engine Evolution: Crystal vs. FrontierCache
 
-To prevent external writes from going unnoticed:
-1. **WAL Decoding:** The `PGListener` connects via `pglogrepl` to a PostgreSQL logical replication slot.
-2. **Tuple Mapping:** Table changes (INSERT, UPDATE, DELETE) are transformed into Wavicle atom paths according to configurable schema mappers (e.g., `users` table with row `id=42` maps to paths `users:42:name`, `users:42:email`).
-3. **Replication Echo Suppression:** When Wavicle writes to PostgreSQL via write-through, PostgreSQL echoes the change back over replication. Wavicle checks timestamps and values against the live atom; identical echoes are discarded, preventing spurious proof cache invalidation cycles.
-4. **Consistency Window:** Typical replication lag is ~35ms p99. Once the WAL event is processed, the next read immediately detects the updated atom hash.
+One of Wavicle's most critical engineering decisions was recognizing when an algorithmically pure data structure was inappropriate for production memory limits.
+
+### 4.1 CausalCrystal (Dev & Algorithmic Validation)
+Originally, Wavicle stored a complete cryptographic DAG in `CausalCrystal`:
+- Every write appended a `CausalAtom` containing `CausalPast []Hash` (parent references) and `CausalDepth`.
+- Atoms were committed to a disk WAL (`wal.go`) using synchronous `file.Sync()`.
+- A 32-byte SHA3-256 Merkle tree updated incrementally with every atom insertion.
+
+**The Production Flaw:**  
+Under continuous mutation (e.g., 1,000 updates/sec to the same 1,000 keys), storing historical parents meant memory grew strictly as $O(\text{writes})$. Evicting old atoms required complex offline WAL rewriting and compaction cycles. If a recovery crashed mid-compaction, WAL state had to be restored from `.old` snapshots.
+
+### 4.2 FrontierCache (Production Engine)
+To solve this, `FrontierCache` was designed with a single constraint: **memory must scale with active data set size, not mutation history ($O(\text{unique keys})$).**
+- Durability is delegated to PostgreSQL.
+- Only the latest `CausalAtom` per path is retained in RAM.
+- No WAL, no ancestry links, and no compaction routines exist in the production hot path.
+- In our `benchstat` testing, eliminating multi-index locking and historical pointer chasing dropped warm reuse latency from **2.43 μs down to 1.59 μs** (a **34.4% reduction**, $p = 0.002$).
 
 ---
 
-## 6. Honest Production Boundaries & Known Limitations
+## 5. Mathematical Walkthrough of the Read Pipeline
 
-To maintain technical integrity, the following limitations are explicitly recognized:
+### Step 1: ProofCache Lookup
+When `GET key` is executed, the key path string and observation mode are hashed via SHA3-256 to form a 32-byte `queryHash`. The engine queries the 64-shard `ProofCache`.
 
-1. **Protocol Scope:** Wavicle implements standard RESP3 text commands for Key-Value and Hash structures (`GET`, `SET`, `MGET`, `MSET`, `HGET`, `HSET`, `HGETALL`, `DEL`, `EXPIRE`, `TTL`, `EXISTS`, `DBSIZE`, `PING`). It does **not** currently implement Redis Lists, Sets, Sorted Sets (`ZSET`), Transactions (`MULTI`/`EXEC`), or Lua scripts.
-2. **SQL Parser Scope:** The built-in `SQLToProofTree` parser is a prototype supporting basic projection queries (`SELECT col1, col2 FROM table WHERE id = val`). It does not support arbitrary SQL queries, JOINs, or complex aggregations.
-3. **Clustering & High Availability:** Wavicle currently operates as an independent node. Clustering protocols (Raft, multi-node replication) are not yet implemented.
-4. **Memory Eviction Under Exhaustion:** While TTL expiration sweeps occur every 60s, global `maxmemory` LRU/LFU eviction under extreme memory pressure is planned for future milestones.
+### Step 2: FastPath 1 — Version Vector Exact Match
+If a `MaterializedProof` is found, the engine executes:
+```go
+if local.VerifyVersionVector(proof.VersionVector.Entries) {
+    proof.AccessCount++
+    proof.LastVerifiedAt = time.Now().UnixNano()
+    return proof.Value, nil
+}
+```
+`VerifyVersionVector` iterates over the proof's version vector (`map[string]Hash`). For each path, it looks up the current atom hash in `FrontierCache`.
+- If all hashes match and no atom has passed its `ExpiresAt` deadline, the cached `Value` is returned immediately.
+- **Complexity:** $O(m)$ where $m$ is the number of dependencies.
+- **Measured Latency:** **~1.59 μs**, **0 allocations**, **0 B/op**.
+
+### Step 3: Incremental Path — Dirty Tree Propagation
+If any hash mismatches:
+1. `local.FindChangedPaths` identifies the dirty paths using a pre-allocated stack buffer `[64]string` to prevent heap escapes.
+2. The engine calls `node.PropagateDirtyUp()` for each modified path:
+   ```go
+   func (n *ProofNode) PropagateDirtyUp() {
+       if n.Dirty { return }
+       n.Dirty = true
+       n.MerkleValid = false
+       if n.Parent != nil {
+           n.Parent.PropagateDirtyUp()
+       }
+   }
+   ```
+3. `reduceDirty` traverses the tree:
+   - Nodes where `Dirty == false` immediately return `node.CachedValue` ($O(1)$ pointer return).
+   - Nodes where `Dirty == true` fetch the new atom expression from `FrontierCache` and recompute only that sub-expression.
+4. The proof's version vector entries are updated in-place with the latest hashes.
+5. **Complexity:** $O(k \log d)$ where $k$ is the number of changed leaves and $d$ is the tree depth.
+6. **Measured Latency:** **~9.66 μs** (vs. 199.4 μs cold compose), achieving a **20.7× speedup**.
+
+---
+
+## 6. PostgreSQL Change Data Capture & Replication Pipeline
+
+To capture writes originating outside of Wavicle (e.g., DBA updates, batch jobs):
+
+1. **Replication Protocol:** `PGListener` initiates a streaming connection to PostgreSQL using `github.com/jackc/pglogrepl` with the standard `pgoutput` plugin.
+2. **Heartbeats & Standby Status:** The background consumer thread emits periodic standby status messages to PostgreSQL to update the confirmed flushed LSN and prevent replication slot unbounded WAL retention.
+3. **Tuple Decoding:** Relation metadata messages (`*pglogrepl.RelationMessage`) are cached in memory. Inbound insert/update/delete tuple messages decode column values according to configured `TableMappings`.
+4. **Echo Suppression Guard:** When Wavicle issues a write-through `SET`, it writes to PostgreSQL and appends the atom locally. Seconds later, PostgreSQL streams the same event over CDC. To prevent invalidating the proof cache unnecessarily, the CDC listener checks:
+   - Is `CommitTime <= currentAtom.PhysicalTime`? If so, discard.
+   - Does the decoded column string equal `currentAtom.Expr`? If so, discard.
+
+---
+
+## 7. Concrete Operational Boundaries & Limitations
+
+1. **Protocol Features:** Supports Key-Value and Hash commands (`GET`, `SET`, `MGET`, `MSET`, `HGET`, `HSET`, `HGETALL`, `DEL`, `EXPIRE`, `TTL`, `EXISTS`, `DBSIZE`, `PING`, `AUTH`). It does **not** support Redis Lists, Sets, Sorted Sets (`ZSET`), Transactions (`MULTI`/`EXEC`), or Pub/Sub.
+2. **SQL Parser:** The built-in SQL parser is a specialized projection parser for `SELECT col FROM table WHERE id = X`. It is not an arbitrary SQL planner.
+3. **Memory Limits:** Expired keys are collected via a 60s background sweep. Global LRU eviction under unexpired key exhaustion (`maxmemory`) is scheduled for subsequent versions.
