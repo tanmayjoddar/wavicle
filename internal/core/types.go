@@ -267,7 +267,7 @@ func (e *EEmbed) Serialize() []byte {
 	// Level(1) + ModelVersion(2 bytes) + Vector(1024 bytes)
 	b := make([]byte, 0, 1+2+1024)
 	b = append(b, 2)
-	binary.BigEndian.PutUint16(b[1:3], e.ModelVersion)
+	b = binary.BigEndian.AppendUint16(b, e.ModelVersion)
 	for _, v := range e.Vector {
 		bits := math.Float32bits(v)
 		b = binary.BigEndian.AppendUint32(b, bits)
@@ -413,14 +413,29 @@ func (a *CausalAtom) UnmarshalJSON(data []byte) error {
 	}
 
 	// Try to determine the concrete type of Expr
-	// For now, only EConst is fully supported in SET commands
+	var eCompose struct {
+		Atoms []Hash `json:"Atoms"`
+	}
+	if err := json.Unmarshal(aux.Expr, &eCompose); err == nil && len(eCompose.Atoms) > 0 {
+		a.Expr = NewECompose(eCompose.Atoms)
+		return nil
+	}
+
+	var eField struct {
+		Field  string          `json:"Field"`
+		Source json.RawMessage `json:"Source"`
+	}
+	if err := json.Unmarshal(aux.Expr, &eField); err == nil && eField.Field != "" {
+		a.Expr = NewEFieldAccess(eField.Field, nil)
+		return nil
+	}
+
 	var eConst EConst
 	if err := json.Unmarshal(aux.Expr, &eConst); err == nil && eConst.Value != nil {
 		a.Expr = NewEConst(eConst.Value)
 		return nil
 	}
 
-	// Add more types as needed for recovery
 	return fmt.Errorf("unknown or unsupported Expr type in JSON")
 }
 

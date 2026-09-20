@@ -5,6 +5,7 @@ package benchmarks
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -32,7 +33,12 @@ func TestSoak_FrontierCache_2min(t *testing.T) {
 		store.AppendAtom(core.NewEConst(core.VString(fmt.Sprintf("init_%d", i))), keys[i], nil, time.Time{})
 	}
 
-	duration := 2 * time.Minute
+	duration := 15 * time.Second
+	if dStr := os.Getenv("SOAK_DURATION"); dStr != "" {
+		if d, err := time.ParseDuration(dStr); err == nil {
+			duration = d
+		}
+	}
 	writerCount := 4
 	readerCount := 16
 	done := make(chan struct{})

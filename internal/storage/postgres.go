@@ -110,10 +110,13 @@ func (s *PostgresStore) GetCurrent(path string) (*core.CausalAtom, bool) {
 	// Return a temporary atom. In main.go, the server should detect this 
 	// and seed the Crystal. Or we could seed it here if we had access to the Crystal.
 	// Since Store is abstract, we return an atom that the caller can use.
-	return &core.CausalAtom{
-		Path: path,
-		Expr: &core.EConst{Value: core.VString(val)},
-	}, true
+	atom := &core.CausalAtom{
+		Path:         path,
+		Expr:         &core.EConst{Value: core.VString(val)},
+		PhysicalTime: time.Now(),
+	}
+	atom.Hash = atom.ComputeHash()
+	return atom, true
 }
 
 func (s *PostgresStore) GetParents(hash core.Hash) ([]core.Hash, bool) {

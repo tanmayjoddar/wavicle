@@ -46,8 +46,16 @@ func (e PolicyError) Error() string {
 }
 
 func matchGlob(pattern, path string) bool {
-	parts := strings.Split(pattern, "/")
-	pathParts := strings.Split(path, "/")
+	normalize := func(s string) []string {
+		s = strings.ReplaceAll(s, ":", "/")
+		trimmed := strings.Trim(s, "/")
+		if trimmed == "" {
+			return nil
+		}
+		return strings.Split(trimmed, "/")
+	}
+	parts := normalize(pattern)
+	pathParts := normalize(path)
 	return matchParts(parts, pathParts)
 }
 
@@ -75,9 +83,9 @@ func matchParts(pattern, path []string) bool {
 }
 
 func (p *FidelityPolicy) MatchRule(path string) *FidelityRule {
-	for _, r := range p.Rules {
-		if matchGlob(r.Pattern, path) {
-			return &r
+	for i := range p.Rules {
+		if matchGlob(p.Rules[i].Pattern, path) {
+			return &p.Rules[i]
 		}
 	}
 	return &p.Rules[len(p.Rules)-1]

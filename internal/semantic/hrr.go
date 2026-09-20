@@ -45,6 +45,9 @@ func Unbind(bundle, key core.Vector) core.Vector {
 }
 
 func Superpose(vectors []core.Vector) core.Vector {
+	if len(vectors) == 0 {
+		return core.Vector{}
+	}
 	n := len(vectors[0])
 	var sum core.Vector
 	for _, v := range vectors {

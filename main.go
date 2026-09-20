@@ -144,13 +144,10 @@ func main() {
 	// Notify server to stop accepting new connections
 	srv.Close()
 
-	// Clean up replication slot (optional, but good practice for clean shutdown)
+	// Clean up replication slot and close connection
 	if pgListener != nil {
 		log.Println("Stopping PostgreSQL replication listener...")
-		// If we wanted to drop the slot, we would do it here.
-		// For now, closing the listener is sufficient to stop the stream.
-		// Note: pgListener doesn't have a Close method exposed in the current interface,
-		// but canceling the main context stops it.
+		pgListener.Close()
 		cancel()
 	}
 

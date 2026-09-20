@@ -68,3 +68,24 @@ func BenchmarkWarmRead_Wavicle(b *testing.B) {
 	}
 }
 
+func BenchmarkWarmRead_FrontierCache(b *testing.B) {
+	store := storage.NewFrontierCache()
+	b.Cleanup(func() { store.Close() })
+	key := "warm_key"
+	h, _ := store.AppendAtom(&core.EConst{Value: core.VString("warm_val")}, key, nil, time.Time{})
+	atom, _ := store.GetCurrent(key)
+
+	proof := &engine.MaterializedProof{
+		ProofTree:     atom.Expr,
+		Value:         atom.Expr.(*core.EConst).Value,
+		VersionVector: &engine.VersionVector{Entries: map[string]core.Hash{key: h}},
+		NodeCache:     make(map[core.Hash]core.Value),
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = engine.ReduceIncremental(proof, store)
+	}
+}
+
+
