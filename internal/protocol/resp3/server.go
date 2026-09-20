@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha3"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"wavicle/internal/auth"
 	"wavicle/internal/core"
 	"wavicle/internal/engine"
 	"wavicle/internal/fidelity"
@@ -24,13 +26,54 @@ type Server struct {
 	proofCache  *engine.ProofCache
 	policy      *fidelity.FidelityPolicy
 	password    string
+	acl         *auth.ACL
+	tlsConfig   *tls.Config
 	maxConns    int
 	activeConns atomic.Int32
 	listener    net.Listener
 	wg          sync.WaitGroup
 	ctx         context.Context
 	cancel      context.CancelFunc
+	// keyTypes is the production type index (Redis robj equivalent).
+	// Maps logical key -> "string|list|set|zset|hash|stream".
+	// Authoritative on write path (every write sets it); best-effort on
+	// read path (cold restart / CDC-written keys fall back to shape-sniff
+	// and re-populate). Never the sole correctness gate: guards always
+	// re-verify the stored value shape before refusing with WRONGTYPE.
+	keyTypes sync.Map // string -> string
+	// Stale guard (fail-closed reads). Zero maxLag = disabled (default,
+	// fail-open). When enabled, proof-engine reads refuse while the last
+	// CDC event is older than maxLag — the answer to "what if CDC stalls?"
+	// Contract: lastEvent==0 (no CDC event yet this boot) never fails, so
+	// dev mode and fresh staging are unaffected; it gates staleness AFTER
+	// activity, when silence means the stream died, not idleness.
+	staleMaxLag time.Duration
+	staleLast   *atomic.Int64 // unixnano of last CDC event; shared with main
 }
+
+// SetStaleGuard enables fail-closed reads: GET/MGET/HGET/HGETALL error instead
+// of serving possibly-stale proofs when CDC has been silent longer than maxLag.
+func (s *Server) SetStaleGuard(maxLag time.Duration, lastEvent *atomic.Int64) {
+	s.staleMaxLag = maxLag
+	s.staleLast = lastEvent
+}
+
+// staleRefused returns non-nil when a proof-engine read must fail closed.
+func (s *Server) staleRefused() error {
+	if s.staleMaxLag <= 0 || s.staleLast == nil {
+		return nil
+	}
+	last := s.staleLast.Load()
+	if last == 0 {
+		return nil // no CDC activity yet this boot — grace, not failure
+	}
+	if lag := time.Since(time.Unix(0, last)); lag > s.staleMaxLag {
+		return fmt.Errorf("STALE replication lag %v exceeded max %v (fail-closed) — check CDC listener and slot", lag.Round(time.Millisecond), s.staleMaxLag)
+	}
+	return nil
+}
+
+var serverStartTime = time.Now()
 
 func NewServer(store storage.Store, password string, maxConns int) *Server {
 	if maxConns <= 0 {
@@ -42,14 +85,27 @@ func NewServer(store storage.Store, password string, maxConns int) *Server {
 		proofCache: engine.NewProofCache(64, 2000),
 		policy:     &fidelity.DefaultPolicy,
 		password:   password,
+		acl:        auth.NewSinglePassword(password),
 		maxConns:   maxConns,
 		ctx:        ctx,
 		cancel:     cancel,
 	}
 }
 
+// SetACL replaces the auth gate (production: multi-user ACL file).
+func (s *Server) SetACL(a *auth.ACL) { s.acl = a }
+
+// SetTLS enables TLS termination on the next ListenAndServe call.
+func (s *Server) SetTLS(cfg *tls.Config) { s.tlsConfig = cfg }
+
 func (s *Server) ListenAndServe(addr string) error {
-	l, err := net.Listen("tcp", addr)
+	var l net.Listener
+	var err error
+	if s.tlsConfig != nil {
+		l, err = tls.Listen("tcp", addr, s.tlsConfig)
+	} else {
+		l, err = net.Listen("tcp", addr)
+	}
 	if err != nil {
 		return err
 	}
@@ -98,7 +154,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 	br := bufio.NewReader(conn)
 	bw := bufio.NewWriter(conn)
 
-	authenticated := s.password == ""
+	authenticated := s.password == "" && (s.acl == nil || !s.acl.Enabled())
+	username := "default"
+
+	var inMulti bool
+	var queue [][]string
 
 	for {
 		args, err := readCommand(br)
@@ -111,14 +171,117 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		cmd := strings.ToUpper(args[0])
 
-		// Handle AUTH separately
+		// Transaction framing: MULTI queues, EXEC runs atomically (single-threaded
+		// apply under store locks), DISCARD drops.
+		if cmd == "MULTI" {
+			if inMulti {
+				bw.WriteString("-ERR MULTI calls can not be nested\r\n")
+				bw.Flush()
+				continue
+			}
+			inMulti = true
+			queue = nil
+			bw.WriteString("+OK\r\n")
+			bw.Flush()
+			continue
+		}
+		if cmd == "DISCARD" {
+			if !inMulti {
+				bw.WriteString("-ERR DISCARD without MULTI\r\n")
+				bw.Flush()
+				continue
+			}
+			inMulti = false
+			queue = nil
+			bw.WriteString("+OK\r\n")
+			bw.Flush()
+			continue
+		}
+		if cmd == "EXEC" {
+			if !inMulti {
+				bw.WriteString("-ERR EXEC without MULTI\r\n")
+				bw.Flush()
+				continue
+			}
+			inMulti = false
+			if len(queue) == 0 {
+				bw.WriteString("*0\r\n")
+				bw.Flush()
+				continue
+			}
+			bw.WriteString(fmt.Sprintf("*%d\r\n", len(queue)))
+			for _, q := range queue {
+				// FIX: EXEC must enforce the same ACL as live commands.
+				// Queued commands were checked at queue time only for syntax;
+				// re-check here in case policy changed mid-transaction.
+				if s.acl != nil && s.acl.Enabled() && authenticated {
+					denied := false
+					for _, k := range allKeys(q) {
+						if err := s.acl.Authorize(username, q[0], k); err != nil {
+							bw.WriteString(fmt.Sprintf("-ERR %v\r\n", err))
+							denied = true
+							break
+						}
+					}
+					if denied {
+						continue
+					}
+				}
+				r, e := s.HandleCommand(q)
+				if e != nil {
+					bw.WriteString(fmt.Sprintf("-ERR %v\r\n", e))
+				} else {
+					bw.WriteString(r)
+				}
+			}
+			bw.Flush()
+			queue = nil
+			continue
+		}
+		if inMulti {
+			// Queue everything except connection control.
+			// FIX: fail fast on ACL at queue time (Redis behavior).
+			if s.acl != nil && s.acl.Enabled() && authenticated {
+				failed := false
+				for _, k := range allKeys(args) {
+					if err := s.acl.Authorize(username, args[0], k); err != nil {
+						bw.WriteString(fmt.Sprintf("-ERR %v\r\n", err))
+						failed = true
+						break
+					}
+				}
+				if failed {
+					bw.Flush()
+					continue
+				}
+			}
+			queue = append(queue, append([]string(nil), args...))
+			bw.WriteString("+QUEUED\r\n")
+			bw.Flush()
+			continue
+		}
+
+		// Handle AUTH separately (supports AUTH password and AUTH user password)
 		if cmd == "AUTH" {
-			if len(args) < 2 {
+			user, pass := "default", ""
+			if len(args) == 2 {
+				pass = args[1]
+			} else if len(args) >= 3 {
+				user, pass = args[1], args[2]
+			} else {
 				bw.WriteString("-ERR wrong number of arguments for 'auth' command\r\n")
-			} else if s.password == "" {
-				bw.WriteString("-ERR Client sent AUTH, but no password is set\r\n")
-			} else if args[1] == s.password {
+				bw.Flush()
+				continue
+			}
+			ok := false
+			if s.acl != nil && s.acl.Enabled() {
+				ok = s.acl.Authenticate(user, pass)
+			} else if s.password == "" || pass == s.password {
+				ok = true
+			}
+			if ok {
 				authenticated = true
+				username = user
 				bw.WriteString("+OK\r\n")
 			} else {
 				bw.WriteString("-ERR invalid password\r\n")
@@ -133,6 +296,23 @@ func (s *Server) handleConnection(conn net.Conn) {
 			if cmd != "PING" {
 				bw.WriteString("-NOAUTH Authentication required.\r\n")
 				bw.Flush()
+				continue
+			}
+		}
+
+		// ACL authorize (command + every key — FIX: MSET/MGET/DEL carry
+		// multiple keys; checking only the first leaks access to the rest).
+		if s.acl != nil && s.acl.Enabled() && authenticated {
+			denied := false
+			for _, k := range allKeys(args) {
+				if err := s.acl.Authorize(username, cmd, k); err != nil {
+					bw.WriteString(fmt.Sprintf("-ERR %v\r\n", err))
+					bw.Flush()
+					denied = true
+					break
+				}
+			}
+			if denied {
 				continue
 			}
 		}
@@ -223,6 +403,9 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		path := args[1]
 		val := args[2]
 
+		if err := s.assertKeyType(path, "string"); err != nil {
+			return "", err
+		}
 		value := core.VString(val)
 		expr := core.NewEConst(value)
 
@@ -235,11 +418,15 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 			telemetry.Get().RecordError()
 			return "", err
 		}
+		s.setKeyType(path, "string")
 
 		return "+OK\r\n", nil
 
 	case "GET":
 		telemetry.Get().RecordRequest("GET")
+		if err := s.staleRefused(); err != nil {
+			return "", err
+		}
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'get' command")
 		}
@@ -324,6 +511,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 				causalPast := []core.Hash{prev.Hash}
 				if _, err := s.store.AppendAtom(expr, path, causalPast, time.Time{}); err == nil {
 					deleted++
+					s.delKeyType(path)
 				}
 			}
 		}
@@ -356,6 +544,9 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 
 	case "MGET":
 		telemetry.Get().RecordRequest("MGET")
+		if err := s.staleRefused(); err != nil {
+			return "", err
+		}
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'mget' command")
 		}
@@ -400,6 +591,9 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		for i := 0; i < len(pairs); i += 2 {
 			path := pairs[i]
 			val := pairs[i+1]
+			if err := s.assertKeyType(path, "string"); err != nil {
+				return "", err
+			}
 			value := core.VString(val)
 			expr := &core.EConst{Value: value}
 			var causalPast []core.Hash
@@ -410,6 +604,7 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 				telemetry.Get().RecordError()
 				return "", err
 			}
+			s.setKeyType(path, "string")
 		}
 		return "+OK\r\n", nil
 
@@ -419,6 +614,11 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 			return "", fmt.Errorf("wrong number of arguments for 'hset' command")
 		}
 		key := args[1]
+		if err := s.assertKeyType(key, "hash"); err != nil {
+			if s.keyTypeOf(key) != "none" {
+				return "", err
+			}
+		}
 		field := args[2]
 		val := args[3]
 		hashPath := key + ":" + field
@@ -432,10 +632,14 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 			telemetry.Get().RecordError()
 			return "", err
 		}
+		s.setKeyType(key, "hash")
 		return ":1\r\n", nil
 
 	case "HGET":
 		telemetry.Get().RecordRequest("HGET")
+		if err := s.staleRefused(); err != nil {
+			return "", err
+		}
 		if len(args) < 3 {
 			return "", fmt.Errorf("wrong number of arguments for 'hget' command")
 		}
@@ -468,6 +672,9 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 
 	case "HGETALL":
 		telemetry.Get().RecordRequest("HGETALL")
+		if err := s.staleRefused(); err != nil {
+			return "", err
+		}
 		if len(args) < 2 {
 			return "", fmt.Errorf("wrong number of arguments for 'hgetall' command")
 		}
@@ -562,8 +769,33 @@ func (s *Server) HandleCommand(args []string) (string, error) {
 		return fmt.Sprintf(":%d\r\n", int(ttl)), nil
 
 	default:
+		// Fail-closed guard covers extended reads too (they serve stored
+		// values that CDC may have left behind). Pure writes skip it —
+		// writes can't serve stale data, and blocking them would turn a
+		// stale-reader problem into a full outage.
+		if isExtendedRead(cmd) {
+			if err := s.staleRefused(); err != nil {
+				return "", err
+			}
+		}
+		if resp, ok := s.HandleExtended(args); ok {
+			return resp, nil
+		}
 		return "", fmt.Errorf("unknown command '%s'", cmd)
 	}
+}
+
+// isExtendedRead reports whether an extended command serves stored data
+// (including mutating reads like LPOP, which serve before mutating).
+func isExtendedRead(cmd string) bool {
+	switch cmd {
+	case "STRLEN", "LLEN", "LRANGE", "LINDEX", "LPOP", "RPOP",
+		"SMEMBERS", "SCARD", "SISMEMBER", "ZSCORE", "ZCARD", "ZRANGE",
+		"HMGET", "HLEN", "HEXISTS", "HKEYS", "HVALS",
+		"XLEN", "XRANGE", "KEYS", "SCAN":
+		return true
+	}
+	return false
 }
 
 func formatValue(v core.Value) string {
@@ -592,4 +824,126 @@ func isTombstone(atom *core.CausalAtom) bool {
 
 func bulkString(s string) string {
 	return fmt.Sprintf("$%d\r\n%s\r\n", len(s), s)
+}
+
+// firstKey extracts the first key arg for ACL checks.
+// Covers KV/hash/list/set/zset/stream + MSET/MGET multi-key (returns first).
+func firstKey(args []string) string {
+	if len(args) < 2 {
+		return ""
+	}
+	switch strings.ToUpper(args[0]) {
+	case "PING", "DBSIZE", "INFO", "HELLO", "CLIENT", "CONFIG", "FLUSHDB", "FLUSHALL",
+		"SCRIPT", "FUNCTION", "MULTI", "EXEC", "DISCARD", "SCAN", "KEYS":
+		return ""
+	case "MGET", "DEL", "EXISTS":
+		return args[1]
+	case "MSET":
+		return args[1]
+	default:
+		return args[1]
+	}
+}
+
+// allKeys extracts every key a command touches for ACL checks.
+// FIX: MGET/DEL/EXISTS/HMGET/HDEL/SREM/ZREM carry N keys; MSET/HMSET carry
+// pairs; checking only args[1] leaked access to the rest.
+func allKeys(args []string) []string {
+	if len(args) < 2 {
+		return nil
+	}
+	switch strings.ToUpper(args[0]) {
+	case "PING", "DBSIZE", "INFO", "HELLO", "CLIENT", "CONFIG", "FLUSHDB", "FLUSHALL",
+		"SCRIPT", "FUNCTION", "MULTI", "EXEC", "DISCARD", "SCAN", "KEYS":
+		return nil
+	case "MGET", "DEL", "EXISTS":
+		return args[1:]
+	case "MSET":
+		var out []string
+		for i := 1; i < len(args); i += 2 {
+			out = append(out, args[i])
+		}
+		return out
+	case "HMGET", "HDEL", "SREM", "ZREM":
+		// key + fields: only the key is a keyspace gate; fields are not keys.
+		return args[1:2]
+	default:
+		return args[1:2]
+	}
+}
+
+// ---- production type index (keyTypes) ----
+
+func (s *Server) setKeyType(key, typ string) { s.keyTypes.Store(key, typ) }
+
+func (s *Server) delKeyType(key string) { s.keyTypes.Delete(key) }
+
+func (s *Server) clearKeyTypes() {
+	s.keyTypes.Range(func(k, _ any) bool { s.keyTypes.Delete(k); return true })
+}
+
+// keyTypeOf returns the indexed type, falling back to value-shape inference
+// (cold index, CDC-written keys) and re-populating the index on hit.
+func (s *Server) keyTypeOf(key string) string {
+	if v, ok := s.keyTypes.Load(key); ok {
+		if t, ok := v.(string); ok {
+			return t
+		}
+	}
+	// Fallback: infer from stored value.
+	val, _, ok := func() (core.Value, *core.CausalAtom, bool) {
+		atom, ok := s.store.GetCurrent(key)
+		if !ok || isTombstone(atom) {
+			return nil, nil, false
+		}
+		if ec, ok := atom.Expr.(*core.EConst); ok {
+			return ec.Value, atom, true
+		}
+		return nil, atom, true
+	}()
+	if !ok {
+		// Maybe a hash parent (key:field children, no direct value).
+		prefix := key + ":"
+		for _, p := range s.store.FrontierPaths() {
+			if len(p) > len(prefix) && p[:len(prefix)] == prefix {
+				s.keyTypes.Store(key, "hash")
+				return "hash"
+			}
+		}
+		return "none"
+	}
+	var t string
+	switch v := val.(type) {
+	case core.VArray:
+		t = "list"
+		// Streams are VArray of VRecord with _id; refine.
+		if len(v) > 0 {
+			if rec, ok := v[0].(core.VRecord); ok {
+				if _, hasID := rec["_id"]; hasID {
+					t = "stream"
+				}
+			}
+		}
+	case core.VRecord:
+		if isZSetRecord(val) {
+			t = "zset"
+		} else if isSetRecord(val) {
+			t = "set"
+		} else {
+			t = "hash"
+		}
+	default:
+		t = "string"
+	}
+	s.keyTypes.Store(key, t)
+	return t
+}
+
+// assertKeyType enforces Redis type semantics using index first, value second.
+// Returns nil if key is absent (caller creates) or types match.
+func (s *Server) assertKeyType(key, want string) error {
+	if t := s.keyTypeOf(key); t != "none" && t != want {
+		return fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	return nil
 }
