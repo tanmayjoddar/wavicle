@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -59,12 +60,45 @@ func (pm *PathMapper) MapRowToPaths(action string, values map[string]any) []stri
 }
 
 func (pm *PathMapper) expandTemplate(values map[string]any) string {
-	var key string
-	for k, v := range values {
-		switch k {
-		case "id", "ID", "Id":
-			key = pm.Table + ":" + fmt.Sprint(v)
+	// Supports "users:${id}", "users:{id}", "${table}:${id}" and plain "users".
+	tpl := pm.KeyTemplate
+	if tpl == "" {
+		// Fallback: table:id using common id keys.
+		for _, k := range []string{"id", "ID", "Id", "uuid", "UUID"} {
+			if v, ok := values[k]; ok {
+				return pm.Table + ":" + fmt.Sprint(v)
+			}
 		}
+		return ""
 	}
-	return key
+	out := tpl
+	// ${table} / {table}
+	out = strings.ReplaceAll(out, "${table}", pm.Table)
+	out = strings.ReplaceAll(out, "{table}", pm.Table)
+	// ${col} / {col} / :col for every column value.
+	for k, v := range values {
+		vs := fmt.Sprint(v)
+		out = strings.ReplaceAll(out, "${"+k+"}", vs)
+		out = strings.ReplaceAll(out, "{"+k+"}", vs)
+	}
+	// Legacy ":id" suffix style: "users:${id}" already handled; bare "users"
+	// means "users:<id>".
+	if out == pm.Table {
+		for _, k := range []string{"id", "ID", "Id", "uuid", "UUID"} {
+			if v, ok := values[k]; ok {
+				return pm.Table + ":" + fmt.Sprint(v)
+			}
+		}
+		return ""
+	}
+	// If template still contains unexpanded ${...}, fall back to id-suffix.
+	if strings.Contains(out, "${") {
+		for _, k := range []string{"id", "ID", "Id"} {
+			if v, ok := values[k]; ok {
+				return pm.Table + ":" + fmt.Sprint(v)
+			}
+		}
+		return ""
+	}
+	return out
 }
