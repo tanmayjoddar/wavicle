@@ -10,17 +10,30 @@ import (
 )
 
 type Config struct {
-	Server  ServerConfig  `yaml:"server"`
-	Storage StorageConfig `yaml:"storage"`
-	Engine  EngineConfig  `yaml:"engine"`
-	DB      DBConfig      `yaml:"db"`
-	Metrics MetricsConfig `yaml:"metrics"`
-	Auth    AuthConfig    `yaml:"auth"`
-	Logging LoggingConfig `yaml:"logging"`
+	Server     ServerConfig      `yaml:"server"`
+	Storage    StorageConfig     `yaml:"storage"`
+	Engine     EngineConfig      `yaml:"engine"`
+	DB         DBConfig          `yaml:"db"`
+	MySQL      MySQLConfig       `yaml:"mysql"`
+	Cluster    ClusterConfig     `yaml:"cluster"`
+	SlotMon    SlotMonitorConfig `yaml:"slot_monitor"`
+	Metrics    MetricsConfig     `yaml:"metrics"`
+	Auth       AuthConfig        `yaml:"auth"`
+	Logging    LoggingConfig     `yaml:"logging"`
 }
 
 type AuthConfig struct {
-	Password string `yaml:"requirepass"`
+	Password string    `yaml:"requirepass"`
+	ACLFile  string    `yaml:"acl_file"`
+	Users    []ACLUser `yaml:"users"`
+}
+
+type ACLUser struct {
+	Name        string   `yaml:"name"`
+	Password    string   `yaml:"password"`
+	Commands    []string `yaml:"commands"`
+	KeyPatterns []string `yaml:"keys"`
+	Admin       bool     `yaml:"admin"`
 }
 
 type ServerConfig struct {
@@ -28,13 +41,48 @@ type ServerConfig struct {
 	MaxConns     int           `yaml:"max_connections"`
 	ReadTimeout  time.Duration `yaml:"read_timeout"`
 	WriteTimeout time.Duration `yaml:"write_timeout"`
+	TLS          TLSConfig     `yaml:"tls"`
+}
+
+type TLSConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
 }
 
 type StorageConfig struct {
-	DataDir        string `yaml:"data_dir"`
-	Engine         string `yaml:"engine"` // "crystal" or "postgres" or "mysql"
-	MaxFrontier    int    `yaml:"max_frontier"`
-	MaxMemoryBytes int64  `yaml:"max_memory_bytes"`
+	DataDir        string         `yaml:"data_dir"`
+	Engine         string         `yaml:"engine"` // "crystal" or "postgres" or "mysql"
+	MaxFrontier    int            `yaml:"max_frontier"`
+	MaxMemoryBytes int64          `yaml:"max_memory_bytes"`
+	Shards         int            `yaml:"shards"` // frontier shards, default 32
+	Snapshot       SnapshotConfig `yaml:"snapshot"`
+}
+
+type SnapshotConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Path     string `yaml:"path"`
+	Interval string `yaml:"interval"`
+}
+
+type ClusterConfig struct {
+	Enabled  bool     `yaml:"enabled"`
+	Nodes    []string `yaml:"nodes"`
+	Replicas int      `yaml:"replicas"`
+}
+
+type MySQLConfig struct {
+	DSN          string   `yaml:"dsn"`
+	Tables       []string `yaml:"tables"`
+	PollInterval string   `yaml:"poll_interval"`
+}
+
+type SlotMonitorConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Interval    string `yaml:"interval"`
+	WarnBytes   int64  `yaml:"warn_bytes"`
+	PageBytes   int64  `yaml:"page_bytes"`
+	SlotName    string `yaml:"slot_name"`
 }
 
 type EngineConfig struct {
@@ -53,6 +101,10 @@ type DBConfig struct {
 	ReplicationSlot string         `yaml:"replication_slot"`
 	Publication     string         `yaml:"publication"`
 	TableMappings   []TableMapping `yaml:"table_mappings"`
+	// MaxStaleness enables fail-closed reads (e.g. "2s"): proof-engine reads
+	// error instead of serving possibly-stale data when CDC has been silent
+	// longer than this. "" (default) = fail-open, current behavior.
+	MaxStaleness string `yaml:"max_staleness"`
 }
 
 type TableMapping struct {
@@ -84,6 +136,16 @@ func Default() *Config {
 			Engine:         "crystal",
 			MaxFrontier:    10000000,
 			MaxMemoryBytes: 4 * 1024 * 1024 * 1024, // 4GB default
+			Shards:         32,
+			Snapshot:       SnapshotConfig{Enabled: true, Path: "data/frontier.snapshot", Interval: "5m"},
+		},
+		Cluster: ClusterConfig{Enabled: false, Replicas: 128},
+		SlotMon: SlotMonitorConfig{
+			Enabled:   true, // effective only in postgres mode with a DSN
+			Interval:  "15s",
+			WarnBytes: 1 << 30,      // 1GB retained WAL
+			PageBytes: 10 << 30,     // 10GB retained WAL
+			SlotName:  "wavicle_slot", // overridden by DB.ReplicationSlot at runtime
 		},
 		Engine: EngineConfig{
 			ProofCache: ProofCacheConfig{
@@ -143,6 +205,9 @@ func (c *Config) LoadFromEnv() {
 	if v := os.Getenv("WAVICLE_DB_PUBLICATION"); v != "" {
 		c.DB.Publication = v
 	}
+	if v := os.Getenv("WAVICLE_MAX_STALENESS"); v != "" {
+		c.DB.MaxStaleness = v
+	}
 	if v := os.Getenv("WAVICLE_METRICS_ENABLED"); v != "" {
 		c.Metrics.Enabled = (v == "true")
 	}
@@ -154,6 +219,44 @@ func (c *Config) LoadFromEnv() {
 	}
 	if v := os.Getenv("WAVICLE_AUTH_PASSWORD"); v != "" {
 		c.Auth.Password = v
+	}
+	if v := os.Getenv("WAVICLE_ACL_FILE"); v != "" {
+		c.Auth.ACLFile = v
+	}
+	if v := os.Getenv("WAVICLE_TLS_ENABLED"); v == "true" {
+		c.Server.TLS.Enabled = true
+	}
+	if v := os.Getenv("WAVICLE_TLS_CERT"); v != "" {
+		c.Server.TLS.CertFile = v
+	}
+	if v := os.Getenv("WAVICLE_TLS_KEY"); v != "" {
+		c.Server.TLS.KeyFile = v
+	}
+	if v := os.Getenv("WAVICLE_SNAPSHOT_PATH"); v != "" {
+		c.Storage.Snapshot.Path = v
+	}
+	if v := os.Getenv("WAVICLE_MYSQL_DSN"); v != "" {
+		c.MySQL.DSN = v
+	}
+	if v := os.Getenv("WAVICLE_CLUSTER_NODES"); v != "" {
+		c.Cluster.Nodes = strings.Split(v, ",")
+		c.Cluster.Enabled = len(c.Cluster.Nodes) > 0
+	}
+	if v := os.Getenv("WAVICLE_SLOTMON_ENABLED"); v != "" {
+		c.SlotMon.Enabled = (v == "true")
+	}
+	if v := os.Getenv("WAVICLE_SLOTMON_INTERVAL"); v != "" {
+		c.SlotMon.Interval = v
+	}
+	if v := os.Getenv("WAVICLE_SLOT_WARN_BYTES"); v != "" {
+		if b, err := ParseBytes(v); err == nil && b > 0 {
+			c.SlotMon.WarnBytes = b
+		}
+	}
+	if v := os.Getenv("WAVICLE_SLOT_PAGE_BYTES"); v != "" {
+		if b, err := ParseBytes(v); err == nil && b > 0 {
+			c.SlotMon.PageBytes = b
+		}
 	}
 
 	// Internal limits
