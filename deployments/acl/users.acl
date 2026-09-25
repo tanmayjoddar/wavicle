@@ -1,0 +1,13 @@
+# Wavicle ACL file — one user per line.
+# IMPORTANT: chmod 0600 this file. Passwords are cleartext here, hashed (SHA256)
+# in memory at startup. Prefer env-provided secrets management in production.
+#
+# Syntax: user <name> <on|off> [>password] [+CMD|-CMD|+@all] [~pattern ...] [reset]
+#   - users default OFF unless `on` is present
+#   - `+@all` = all commands on all keys (admin)
+#   - `~prefix:*` = key allowlist; multi-key commands check EVERY key
+#   - unknown tokens are a hard boot error (fail fast, never half-secured)
+
+user admin on >change-me-admin +@all ~*
+user app on >change-me-app +GET +MGET +HGET +HGETALL +SET +MSET +HSET +HMSET +HDEL +EXISTS +INCR +DECR +LPUSH +RPUSH +LPOP +RPOP +SADD +SREM +ZADD +ZREM +XADD ~users:* ~profile:* ~feed:*
+user readonly on >change-me-ro +GET +MGET +HGET +HGETALL +EXISTS +TYPE +KEYS +SCAN +INFO ~*

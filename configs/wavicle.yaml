@@ -1,0 +1,77 @@
+# Wavicle production config — copy to wavicle.yaml and tune.
+server:
+  listen: ":6379"
+  max_connections: 10000
+  read_timeout: 5s
+  write_timeout: 5s
+  tls:
+    enabled: false
+    cert_file: "deployments/tls/wavicle.crt"
+    key_file: "deployments/tls/wavicle.key"
+
+storage:
+  data_dir: "data"
+  engine: "postgres" # crystal | postgres | mysql
+  max_frontier: 10000000
+  max_memory_bytes: 4294967296 # 4GB; also WAVICLE_MAX_MEMORY=500MB
+  shards: 32
+  snapshot:
+    enabled: true
+    path: "data/frontier.snapshot"
+    interval: "5m"
+
+engine:
+  proof_cache:
+    max_entries: 100000
+    max_bytes: 209715200
+    shards: 64
+
+db:
+  type: "postgres"
+  dsn: "postgres://wavicle:wavicle@db:5432/wavicle?sslmode=disable"
+  replication_slot: "wavicle_slot"
+  publication: "wavicle_proofs"
+  table_mappings:
+    - table: "users"
+      key_template: "users:${id}"
+      columns: ["name", "email"]
+
+mysql:
+  dsn: ""
+  tables: []
+  poll_interval: "500ms"
+
+cluster:
+  enabled: false
+  nodes: ["wavicle-1:6379", "wavicle-2:6379", "wavicle-3:6379"]
+  replicas: 128
+
+slot_monitor:
+  enabled: true     # postgres mode only; one pg_replication_slots read per interval
+  interval: "15s"
+  warn_bytes: 1073741824   # 1GB retained WAL → WARN log
+  page_bytes: 10737418240  # 10GB retained WAL → PAGE log (human drops slot per runbook)
+  slot_name: "wavicle_slot" # overridden by db.replication_slot at runtime
+
+metrics:
+  enabled: true
+  listen: ":8080"
+
+auth:
+  requirepass: "change-me"  # fallback when neither acl_file nor users is set
+  acl_file: "deployments/acl/users.acl"  # wins over inline users; chmod 0600; bad file = refuse boot
+  users:
+    - name: "app"
+      password: "app-secret"
+      commands: ["GET", "MGET", "HGET", "HGETALL", "SET", "MSET", "HSET"]
+      keys: ["users:*", "profile:*"]
+      admin: false
+    - name: "admin"
+      password: "admin-secret"
+      commands: []
+      keys: []
+      admin: true
+
+logging:
+  level: "info"
+  format: "text"
