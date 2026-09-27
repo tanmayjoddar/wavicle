@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 	"wavicle/internal/core"
-	"wavicle/internal/semantic"
 	"wavicle/internal/telemetry"
 )
 
@@ -133,10 +132,13 @@ func (c *CausalCrystal) AppendAtom(expr core.CombinatorExpr, path string, causal
 	}
 
 	atom := &core.CausalAtom{
-		Expr:         expr,
+		Expr:     expr,
 		CausalPast:   causalPast,
 		CausalDepth:  depth,
-		Vector:       embedExpression(expr),
+		// NOTE: Vector embedding removed (Sep 2026) — semantic.EmbedString output
+		// was stored on every dev-mode atom but never read by any code path.
+		// The core.Vector TYPE stays (part of the EEmbed algebra); only the
+		// per-append computation is gone.
 		Domain:       inferDomain(path),
 		LogicalClock: c.clock.Add(1),
 		PhysicalTime: time.Now(),
@@ -427,10 +429,6 @@ func (c *CausalCrystal) evictIfNeeded() {
 		}
 		return true
 	})
-}
-
-func embedExpression(expr core.CombinatorExpr) core.Vector {
-	return semantic.EmbedString(string(expr.Serialize()))
 }
 
 func inferDomain(path string) core.Domain {
