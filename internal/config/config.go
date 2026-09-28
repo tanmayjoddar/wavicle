@@ -101,9 +101,10 @@ type DBConfig struct {
 	ReplicationSlot string         `yaml:"replication_slot"`
 	Publication     string         `yaml:"publication"`
 	TableMappings   []TableMapping `yaml:"table_mappings"`
-	// MaxStaleness enables fail-closed reads (e.g. "2s"): proof-engine reads
-	// error instead of serving possibly-stale data when CDC has been silent
-	// longer than this. "" (default) = fail-open, current behavior.
+	// MaxStaleness arms fail-closed reads in MySQL mode: proof-engine reads
+	// error when the poller hasn't completed a clean tick within this bound
+	// (e.g. "2s"). "" (default) = fail-open. PG mode ignores this — its
+	// guard runs off slot health whenever the slot monitor runs.
 	MaxStaleness string `yaml:"max_staleness"`
 }
 

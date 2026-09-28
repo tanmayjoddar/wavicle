@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"wavicle/internal/telemetry"
@@ -58,12 +59,20 @@ func ClassifySlot(info *SlotInfo, queryErr error, warnBytes, pageBytes int64) (S
 
 // SlotMonitorConfig configures the watchdog. One cheap
 // `pg_replication_slots` read per interval — negligible at any load.
+//
+// State (optional, shared with the server's stale guard): the monitor stores
+//   -1 = unknown yet (boot grace — reads serve),
+//   -2 = slot broken (query error, missing, or inactive — reads fail closed),
+//   >=0 = retained-WAL lag bytes (reads fail closed at PageBytes).
+// An idle-but-healthy database holds lag ≈ 0, so quiet streams SERVE —
+// silence only fails reads when the slot proves we are behind or blind.
 type SlotMonitorConfig struct {
 	DSN       string
 	SlotName  string
 	Interval  time.Duration
 	WarnBytes int64
 	PageBytes int64
+	State     *atomic.Int64
 }
 
 // SlotMonitor polls the replication slot and escalates before PG fills its disk.
@@ -81,13 +90,21 @@ func NewSlotMonitor(cfg SlotMonitorConfig) *SlotMonitor {
 	return &SlotMonitor{cfg: cfg}
 }
 
-// CheckOnce queries, classifies, records the metric, and logs on escalation.
-// De-escalation (PAGE→OK) is logged once via lastPage reset.
+// CheckOnce queries, classifies, records the metric, publishes shared state,
+// and logs on escalation. De-escalation (PAGE→OK) is logged once via lastPage reset.
 func (m *SlotMonitor) CheckOnce(ctx context.Context) (SlotLevel, *SlotInfo) {
 	info, err := QuerySlotInfo(ctx, m.cfg.DSN, m.cfg.SlotName)
 	level, msg := ClassifySlot(info, err, m.cfg.WarnBytes, m.cfg.PageBytes)
 	if info != nil {
 		telemetry.Get().RecordSlotBytes(info.LagBytes)
+	}
+	if m.cfg.State != nil {
+		switch {
+		case err != nil || info == nil || !info.Active:
+			m.cfg.State.Store(-2)
+		default:
+			m.cfg.State.Store(info.LagBytes)
+		}
 	}
 	switch level {
 	case SlotPage:

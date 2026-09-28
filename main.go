@@ -42,10 +42,15 @@ func main() {
 	var store storage.Store
 	var pgListener *replication.PGListener
 
-	// cdcFresh records the unixnano of the last CDC event (PG or MySQL).
-	// The server's stale guard reads it to fail reads closed when the stream
-	// goes silent. Shared by pointer so the applier needs no server handle.
-	cdcFresh := &atomic.Int64{}
+	// Fail-closed wiring (stale guard v2 — health oracles, not event clocks):
+	// PG arms from slot-monitor state, MySQL from poll health. Declared here
+	// because the server is created after the backend branches below.
+	slotState := &atomic.Int64{}
+	slotState.Store(-1) // unknown = boot grace, reads serve
+	pgFailClosed := false
+	var pgPageBytes int64
+	var mysqlLastOK *atomic.Int64
+	var mysqlMaxSilence time.Duration
 
 	if cfg.DB.Type == "postgres" {
 		log.Printf("Initializing PostgreSQL write-through to %s", cfg.DB.DSN)
@@ -92,12 +97,14 @@ func main() {
 			log.Printf("Warning: Failed to start PG replication: %v", err)
 		} else {
 			log.Printf("Replication listener started, waiting for events...")
-			go runCDCApplier(local, store, events, cdcFresh)
+			go runCDCApplier(local, store, events)
 		}
 
 		// Slot watchdog: one cheap pg_replication_slots read per tick.
 		// Pages before retained WAL fills PG's disk (~7GB/h at 4k writes/s).
 		// Runs even if the listener failed — a dead listener IS the emergency.
+		// Its shared state ALSO arms fail-closed reads: slot-proven behind or
+		// blind fails reads; unknown (boot) and healthy-idle (lag ~0) serve.
 		if cfg.SlotMon.Enabled && cfg.DB.DSN != "" {
 			slotName := cfg.DB.ReplicationSlot
 			if slotName == "" {
@@ -115,10 +122,12 @@ func main() {
 				Interval:  monInterval,
 				WarnBytes: cfg.SlotMon.WarnBytes,
 				PageBytes: cfg.SlotMon.PageBytes,
+				State:     slotState,
 			})
 			go mon.Run(ctx)
 			log.Printf("Slot monitor watching %q every %v (warn %dB, page %dB)",
 				slotName, monInterval, cfg.SlotMon.WarnBytes, cfg.SlotMon.PageBytes)
+			pgFailClosed, pgPageBytes = true, cfg.SlotMon.PageBytes
 		}
 	} else if cfg.DB.Type == "mysql" {
 		log.Printf("Initializing MySQL polling CDC (tables: %v)", cfg.MySQL.Tables)
@@ -154,7 +163,17 @@ func main() {
 			log.Printf("Warning: Failed to start MySQL CDC: %v", err)
 		} else {
 			log.Printf("MySQL CDC poller started, waiting for events...")
-			go runCDCApplier(local, store, events, cdcFresh)
+			go runCDCApplier(local, store, events)
+		}
+		// Fail-closed from poll health (opt-in): quiet-but-polling-clean serves;
+		// only a dead/erroring poller fails reads. Unset = fail-open.
+		mysqlLastOK = mysqlListener.LastPollOK()
+		if cfg.DB.MaxStaleness != "" {
+			if d, err := time.ParseDuration(cfg.DB.MaxStaleness); err == nil && d > 0 {
+				mysqlMaxSilence = d
+			} else {
+				log.Printf("Invalid max_staleness %q, MySQL stale guard disabled (fail-open)", cfg.DB.MaxStaleness)
+			}
 		}
 	} else {
 		// Dev mode: full CausalCrystal with WAL, compaction, and causal DAG.
@@ -168,16 +187,17 @@ func main() {
 
 	srv := resp3.NewServer(store, cfg.Auth.Password, cfg.Server.MaxConns)
 
-	// Fail-closed reads (opt-in): refuse proof-engine reads when CDC has been
-	// silent longer than max. Default off — fail-open preserves current
-	// behavior for dev, fresh staging, and anyone who hasn't opted in.
-	if cfg.DB.MaxStaleness != "" {
-		if maxLag, err := time.ParseDuration(cfg.DB.MaxStaleness); err == nil && maxLag > 0 {
-			srv.SetStaleGuard(maxLag, cdcFresh)
-			log.Printf("Stale guard armed: reads fail closed after %v CDC silence", maxLag)
-		} else {
-			log.Printf("Invalid max_staleness %q, stale guard disabled (fail-open)", cfg.DB.MaxStaleness)
-		}
+	// Fail-closed reads, armed from health oracles (never event recency, so an
+	// idle-but-healthy database keeps serving):
+	// PG: slot monitor state (unknown/boot and healthy-idle serve; slot-proven
+	// behind-or-blind fails). MySQL: poll health when max_staleness is set.
+	if pgFailClosed {
+		srv.SetStaleGuardPG(slotState, pgPageBytes)
+		log.Printf("Stale guard armed (PG slot health, page %dB)", pgPageBytes)
+	}
+	if mysqlMaxSilence > 0 && mysqlLastOK != nil {
+		srv.SetStaleGuardMySQL(mysqlLastOK, mysqlMaxSilence)
+		log.Printf("Stale guard armed (MySQL poll health, max silence %v)", mysqlMaxSilence)
 	}
 
 	// Production auth: ACL file wins, then inline config users, else the
@@ -269,10 +289,8 @@ func main() {
 // runCDCApplier folds database change events into the local frontier.
 // Shared by the PG logical-replication listener and the MySQL poller so both
 // backends get identical echo-suppression and tombstone semantics.
-// Every event also stamps markFresh (the server's stale-guard clock).
-func runCDCApplier(local *storage.ShardedFrontierCache, store storage.Store, events <-chan replication.ChangeEvent, markFresh *atomic.Int64) {
+func runCDCApplier(local *storage.ShardedFrontierCache, store storage.Store, events <-chan replication.ChangeEvent) {
 	for evt := range events {
-		markFresh.Store(time.Now().UnixNano())
 		telemetry.Get().RecordReplicationLag(evt.Table, evt.CommitTime)
 		for _, path := range evt.AffectedPaths {
 			log.Printf("DB Change [%s]: path %s (lag: %v)", evt.Action, path, time.Since(evt.CommitTime))

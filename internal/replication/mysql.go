@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,7 +29,15 @@ type MySQLListener struct {
 	mappers []PathMapper
 	events  chan ChangeEvent
 	cancel  context.CancelFunc
+	// lastOK is unixnano of the last fully successful poll tick (all tables
+	// queried without error). 0 = never. Shared with the server's stale
+	// guard: a quiet-but-healthy database polls clean every tick, so idle
+	// SERVES; only a dead/erroring poller goes silent and fails reads.
+	lastOK atomic.Int64
 }
+
+// LastPollOK exposes the poll-health clock for fail-closed reads.
+func (l *MySQLListener) LastPollOK() *atomic.Int64 { return &l.lastOK }
 
 func NewMySQLListener(cfg MySQLConfig) *MySQLListener {
 	if cfg.PollInterval <= 0 {
@@ -78,28 +87,36 @@ func (l *MySQLListener) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			tickOK := true
 			for _, table := range l.cfg.Tables {
-				l.pollTable(ctx, db, table, wm)
+				if !l.pollTable(ctx, db, table, wm) {
+					tickOK = false
+				}
+			}
+			// Stamp ONLY on a fully clean tick: any table error means this
+			// poll proved nothing, and the stale guard must see silence.
+			if tickOK {
+				l.lastOK.Store(time.Now().UnixNano())
 			}
 		}
 	}
 }
 
-func (l *MySQLListener) pollTable(ctx context.Context, db *sql.DB, table string, wm map[string]int64) {
+func (l *MySQLListener) pollTable(ctx context.Context, db *sql.DB, table string, wm map[string]int64) bool {
 	// FIX (SQL injection): table comes from config; validate identifier like
 	// PostgresStore does before interpolating into SELECT.
 	if !isValidMySQLIdentifier(table) {
-		return
+		return false
 	}
 	// Try id-watermark first; fall back silently if schema differs.
 	rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM `%s` WHERE id > ? ORDER BY id ASC LIMIT 1000", table), wm[table])
 	if err != nil {
-		return
+		return false
 	}
 	defer rows.Close()
 	cols, err := rows.Columns()
 	if err != nil {
-		return
+		return false
 	}
 	for rows.Next() {
 		vals := make([]any, len(cols))
@@ -122,7 +139,7 @@ func (l *MySQLListener) pollTable(ctx context.Context, db *sql.DB, table string,
 		select {
 		case l.events <- ChangeEvent{Table: table, Action: "UPDATE", NewValues: row, AffectedPaths: paths, CommitTime: time.Now()}:
 		case <-ctx.Done():
-			return
+			return false
 		default:
 		}
 		if id, ok := row["id"]; ok {
@@ -133,6 +150,7 @@ func (l *MySQLListener) pollTable(ctx context.Context, db *sql.DB, table string,
 			}
 		}
 	}
+	return rows.Err() == nil
 }
 
 func (l *MySQLListener) mapRow(table string, values map[string]any) []string {

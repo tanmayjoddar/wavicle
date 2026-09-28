@@ -41,34 +41,50 @@ type Server struct {
 	// and re-populate). Never the sole correctness gate: guards always
 	// re-verify the stored value shape before refusing with WRONGTYPE.
 	keyTypes sync.Map // string -> string
-	// Stale guard (fail-closed reads). Zero maxLag = disabled (default,
-	// fail-open). When enabled, proof-engine reads refuse while the last
-	// CDC event is older than maxLag — the answer to "what if CDC stalls?"
-	// Contract: lastEvent==0 (no CDC event yet this boot) never fails, so
-	// dev mode and fresh staging are unaffected; it gates staleness AFTER
-	// activity, when silence means the stream died, not idleness.
-	staleMaxLag time.Duration
-	staleLast   *atomic.Int64 // unixnano of last CDC event; shared with main
+	// Stale guard v2 (fail-closed reads). The oracle is CDC HEALTH, not event
+	// recency — that distinction is the whole design (see below).
+	//
+	// PG: slotState shared with the slot monitor: -1 unknown (boot grace,
+	// serve), -2 slot broken (fail), >=0 retained-WAL lag bytes (fail at
+	// slotPageBytes). An idle-but-healthy database holds lag ≈ 0, so quiet
+	// streams SERVE; only proven behind-or-blind streams fail reads.
+	// MySQL: lastOK is the poller's last fully-clean tick (0 = never, grace);
+	// a quiet-but-healthy database polls clean, so idle SERVES there too.
+	// Neither set = disabled (dev mode, fail-open — today's default).
+	stalePGState *atomic.Int64
+	stalePGPage  int64
+	staleMyLast  *atomic.Int64
+	staleMyMax   time.Duration
 }
 
-// SetStaleGuard enables fail-closed reads: GET/MGET/HGET/HGETALL error instead
-// of serving possibly-stale proofs when CDC has been silent longer than maxLag.
-func (s *Server) SetStaleGuard(maxLag time.Duration, lastEvent *atomic.Int64) {
-	s.staleMaxLag = maxLag
-	s.staleLast = lastEvent
+// SetStaleGuardPG arms fail-closed reads from slot health (see field docs).
+func (s *Server) SetStaleGuardPG(slotState *atomic.Int64, pageBytes int64) {
+	s.stalePGState = slotState
+	s.stalePGPage = pageBytes
 }
 
-// staleRefused returns non-nil when a proof-engine read must fail closed.
+// SetStaleGuardMySQL arms fail-closed reads from poll health.
+func (s *Server) SetStaleGuardMySQL(lastOK *atomic.Int64, maxSilence time.Duration) {
+	s.staleMyLast = lastOK
+	s.staleMyMax = maxSilence
+}
+
+// staleRefused returns non-nil when a data read must fail closed.
 func (s *Server) staleRefused() error {
-	if s.staleMaxLag <= 0 || s.staleLast == nil {
-		return nil
+	if s.stalePGState != nil {
+		switch st := s.stalePGState.Load(); {
+		case st == -2:
+			return fmt.Errorf("STALE CDC blind (slot missing/inactive) — check listener and slot")
+		case st >= 0 && st >= s.stalePGPage:
+			return fmt.Errorf("STALE slot lag %d bytes at page threshold %d — check CDC listener", st, s.stalePGPage)
+		}
 	}
-	last := s.staleLast.Load()
-	if last == 0 {
-		return nil // no CDC activity yet this boot — grace, not failure
-	}
-	if lag := time.Since(time.Unix(0, last)); lag > s.staleMaxLag {
-		return fmt.Errorf("STALE replication lag %v exceeded max %v (fail-closed) — check CDC listener and slot", lag.Round(time.Millisecond), s.staleMaxLag)
+	if s.staleMyLast != nil && s.staleMyMax > 0 {
+		if last := s.staleMyLast.Load(); last != 0 {
+			if lag := time.Since(time.Unix(0, last)); lag > s.staleMyMax {
+				return fmt.Errorf("STALE MySQL poller silent %v over max %v — check poller and DB", lag.Round(time.Millisecond), s.staleMyMax)
+			}
+		}
 	}
 	return nil
 }

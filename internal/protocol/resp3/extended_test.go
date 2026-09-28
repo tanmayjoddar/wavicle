@@ -125,30 +125,71 @@ func TestStaleGuard_DisabledByDefault(t *testing.T) {
 	mustOK(t, s, "GET", "k") // no guard configured — fail-open, always serves
 }
 
-func TestStaleGuard_FailClosedOnSilence(t *testing.T) {
+func TestStaleGuard_PGSlotHealth(t *testing.T) {
+	s := newTestServer(t)
+	mustOK(t, s, "SET", "k", "v")
+	state := &atomic.Int64{}
+	s.SetStaleGuardPG(state, 10<<30)
+
+	// Unknown (boot, monitor hasn't reported): grace, serves.
+	state.Store(-1)
+	mustOK(t, s, "GET", "k")
+
+	// Healthy-but-quiet: lag 0 with NO events ever — idle streams SERVE.
+	// (This is the case event-recency oracles get wrong.)
+	state.Store(0)
+	mustOK(t, s, "GET", "k")
+
+	// Slot-proven behind: fail closed.
+	state.Store(10 << 30)
+	if _, err := s.HandleCommand([]string{"GET", "k"}); err == nil || !strings.Contains(err.Error(), "STALE") {
+		t.Fatalf("page-level lag must fail closed, got err=%v", err)
+	}
+	// Slot blind (missing/inactive): fail closed.
+	state.Store(-2)
+	if _, err := s.HandleCommand([]string{"GET", "k"}); err == nil || !strings.Contains(err.Error(), "STALE") {
+		t.Fatalf("broken slot must fail closed, got err=%v", err)
+	}
+	// Recovery: healthy again → serves.
+	state.Store(0)
+	mustOK(t, s, "GET", "k")
+
+	// Writes are never gated — blocking writes turns staleness into outage.
+	state.Store(-2)
+	mustOK(t, s, "SET", "k2", "v2")
+}
+
+func TestStaleGuard_MySQLPollHealth(t *testing.T) {
 	s := newTestServer(t)
 	mustOK(t, s, "SET", "k", "v")
 	last := &atomic.Int64{}
-	s.SetStaleGuard(50*time.Millisecond, last)
+	s.SetStaleGuardMySQL(last, 50*time.Millisecond)
 
+	// Never polled (0): grace, serves. Fresh poll: serves.
+	mustOK(t, s, "GET", "k")
 	last.Store(time.Now().UnixNano())
-	mustOK(t, s, "GET", "k") // fresh CDC — serves
+	mustOK(t, s, "GET", "k")
 
+	// Poller silent past bound: fail closed.
 	last.Store(time.Now().Add(-time.Second).UnixNano())
 	if _, err := s.HandleCommand([]string{"GET", "k"}); err == nil || !strings.Contains(err.Error(), "STALE") {
-		t.Fatalf("silent CDC must fail closed, got err=%v", err)
+		t.Fatalf("dead poller must fail closed, got err=%v", err)
 	}
-	// Extended reads gate too.
+	// TYPE is keyless metadata, never gated.
 	if _, err := s.HandleCommand([]string{"TYPE", "k"}); err != nil {
-		t.Fatalf("TYPE is keyless metadata, must not gate: %v", err)
+		t.Fatalf("TYPE must not gate: %v", err)
 	}
-	// Writes are never gated — blocking writes turns staleness into outage.
-	mustOK(t, s, "SET", "k2", "v2")
 }
 
 func TestStaleGuard_BootGrace(t *testing.T) {
 	s := newTestServer(t)
 	mustOK(t, s, "SET", "k", "v")
-	s.SetStaleGuard(time.Second, &atomic.Int64{}) // zero = no CDC yet — grace
+	// True "unknown" is -1, set explicitly by main at boot; a fresh zero
+	// atomic reads as lag 0 (healthy). Both must serve.
+	unknown := &atomic.Int64{}
+	unknown.Store(-1)
+	s.SetStaleGuardPG(unknown, 10<<30)
+	mustOK(t, s, "GET", "k")
+	s.SetStaleGuardPG(&atomic.Int64{}, 10<<30)
 	mustOK(t, s, "GET", "k")
 }
