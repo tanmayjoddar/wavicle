@@ -761,17 +761,16 @@ func (s *Server) HandleExtended(args []string) (string, bool) {
 		seen := map[string]bool{}
 		var keys []string
 		allPaths := s.store.FrontierPaths()
-		direct := make(map[string]bool, len(allPaths))
 		for _, p := range allPaths {
-			direct[p] = true
-		}
-		for _, p := range allPaths {
-			// FIX: collapse hash field paths key:field -> key so KEYS
-			// returns logical Redis keys, not internal storage paths.
+			// Production rule: collapse p to its parent ONLY when the parent
+			// is a real hash (explicit index — HSET/HMSET tagged it).
+			// Flat colon keys (shadow:1, users:42:name) pass through intact.
+			// The old direct-set heuristic collapsed those too (caught live
+			// by the shadow runner: 200 shadow:N keys listed as one "shadow").
 			key := p
 			if idx := strings.LastIndex(p, ":"); idx > 0 {
-				if parent := p[:idx]; !direct[parent] {
-					key = parent
+				if s.isHashKey(p[:idx]) {
+					key = p[:idx]
 				}
 			}
 			if matchAll || strings.HasPrefix(key, prefix) || strings.HasPrefix(p, prefix) {
@@ -817,15 +816,12 @@ func (s *Server) HandleExtended(args []string) (string, bool) {
 		seenScan := map[string]bool{}
 		var keys []string
 		allScan := s.store.FrontierPaths()
-		directScan := make(map[string]bool, len(allScan))
 		for _, p := range allScan {
-			directScan[p] = true
-		}
-		for _, p := range allScan {
+			// Same production rule as KEYS: collapse only under real hashes.
 			key := p
 			if idx := strings.LastIndex(p, ":"); idx > 0 {
-				if parent := p[:idx]; !directScan[parent] {
-					key = parent
+				if s.isHashKey(p[:idx]) {
+					key = p[:idx]
 				}
 			}
 			if prefix == "" || strings.HasPrefix(key, prefix) || strings.HasPrefix(p, prefix) {

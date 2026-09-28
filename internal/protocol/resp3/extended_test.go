@@ -1,6 +1,7 @@
 package resp3
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -83,6 +84,27 @@ func TestRegression_KEYS_CollapsesHash(t *testing.T) {
 	r := mustOK(t, s, "KEYS", "profile:*")
 	if !strings.Contains(r, "profile:1") || strings.Contains(r, "profile:1:theme") {
 		t.Fatalf("KEYS leak internals: %q", r)
+	}
+}
+
+func TestRegression_KEYS_FlatColonKeysIntact(t *testing.T) {
+	// Caught live by the shadow runner: 200 shadow:N keys collapsed to one
+	// phantom "shadow" by a heuristic that couldn't tell hash fields from
+	// flat colon keys. Only explicit-hash parents may collapse.
+	s := newTestServer(t)
+	for i := 0; i < 50; i++ {
+		mustOK(t, s, "SET", fmt.Sprintf("shadow:%d", i), "v")
+	}
+	mustOK(t, s, "HSET", "profile:1", "theme", "dark")
+	r := mustOK(t, s, "KEYS", "shadow:*")
+	for i := 0; i < 50; i++ {
+		if !strings.Contains(r, fmt.Sprintf("shadow:%d", i)) {
+			t.Fatalf("flat key missing from KEYS: %q", r)
+		}
+	}
+	r2 := mustOK(t, s, "KEYS", "*")
+	if !strings.Contains(r2, "profile:1") || strings.Contains(r2, "profile:1:theme") {
+		t.Fatalf("hash collapse regressed: %q", r2)
 	}
 }
 
