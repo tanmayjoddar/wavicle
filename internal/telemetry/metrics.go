@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -215,9 +216,31 @@ func (m *Metrics) RecordAtomCount(count int64) {
 	m.AtomCount.Set(float64(count))
 }
 
+// maxLagTables bounds the `table` label cardinality of ReplicationLagMs.
+// A fresh label per table is an unbounded series explosion if table names are
+// attacker- or tenant-controlled; overflow collapses into "_other".
+// Production note: the aggregate max across tables is what pages — per-table
+// is for diagnosis, so losing granularity past the cap is the right trade.
+const maxLagTables = 64
+
+var (
+	lagTablesMu sync.Mutex
+	lagTables   = map[string]bool{}
+)
+
 func (m *Metrics) RecordReplicationLag(table string, commitTime time.Time) {
 	lag := time.Since(commitTime).Milliseconds()
-	m.ReplicationLagMs.WithLabelValues(table).Set(float64(lag))
+	label := table
+	lagTablesMu.Lock()
+	if !lagTables[table] {
+		if len(lagTables) >= maxLagTables {
+			label = "_other"
+		} else {
+			lagTables[table] = true
+		}
+	}
+	lagTablesMu.Unlock()
+	m.ReplicationLagMs.WithLabelValues(label).Set(float64(lag))
 }
 
 func (m *Metrics) GetMemoryEvictions() float64 {
