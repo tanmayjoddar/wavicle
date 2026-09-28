@@ -1,5 +1,8 @@
 *.log
 *.exe
+/wavicle
+/wavicle-migrate
+/wavicle-cli
 bench_test.exe
 .DS_Store
 Thumbs.db
