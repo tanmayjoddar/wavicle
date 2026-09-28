@@ -23,10 +23,12 @@ availability of PG's disk is a human decision (runbook procedure).
 
 ## Reporting
 
-Security issues: open a private issue or email the maintainer (see git config).
-Do not file public issues for credentials, bypasses, or data-exposure bugs.
-Response target: acknowledge in 48h, fix-or-plan in 7 days. Supported: latest
-`master` and the newest `v*` tag only.
+Security issues: email **tanmayjoddar17@gmail.com** with "[wavicle-security]" in
+the subject. Do not file public issues for credentials, bypasses, or
+data-exposure bugs. Response: best-effort acknowledgment within 3–5 business
+days with a fix-or-plan (solo maintainer alongside internship and exams — a
+modest SLA kept beats an ambitious one missed). Supported: latest `master` and
+the newest `v*` tag only. Latest scan: `docc/VULN_SCAN.md` (2026-09-29, clean).
 
 ## Verified posture (evidence, not adjectives)
 
