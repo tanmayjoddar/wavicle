@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"encoding/json"
 	"net/http"
 	"sync"
 	"time"
@@ -262,5 +263,67 @@ func (m *Metrics) GetTTLEvictions() float64 {
 func ListenAndServe(addr string) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(Get().Registry, promhttp.HandlerOpts{}))
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/readyz", readyHandler)
 	return http.ListenAndServe(addr, mux)
+}
+
+// ---- readiness ----
+
+// readyCheck is one named dependency probe for /readyz.
+type readyCheck struct {
+	name string
+	fn   func() error
+}
+
+var (
+	readyMu     sync.Mutex
+	readyChecks []readyCheck
+)
+
+// RegisterReadyCheck adds a /readyz dependency probe. Probes run on every
+// scrape — keep them cheap (a Ping, a single-row query). Called from main.
+func RegisterReadyCheck(name string, fn func() error) {
+	readyMu.Lock()
+	defer readyMu.Unlock()
+	readyChecks = append(readyChecks, readyCheck{name, fn})
+}
+
+// resetReadyChecks exists for tests (the registry is process-global).
+func resetReadyChecks() {
+	readyMu.Lock()
+	defer readyMu.Unlock()
+	readyChecks = nil
+}
+
+// healthHandler is liveness: 200 iff the process is up and serving HTTP.
+// No dependency checks — kube uses it to decide restarts, never traffic.
+func healthHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+// readyHandler is readiness: 200 only if every registered probe passes,
+// else 503 with a JSON body NAMING the failed checks. kube removes the pod
+// from service on 503; the stale guard is what keeps it from serving lies.
+func readyHandler(w http.ResponseWriter, _ *http.Request) {
+	readyMu.Lock()
+	checks := append([]readyCheck(nil), readyChecks...)
+	readyMu.Unlock()
+	var failed []string
+	for _, c := range checks {
+		if err := c.fn(); err != nil {
+			failed = append(failed, c.name+": "+err.Error())
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if len(failed) > 0 {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		b, _ := json.Marshal(map[string]any{"status": "degraded", "failed": failed})
+		_, _ = w.Write(b)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
