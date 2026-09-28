@@ -955,6 +955,21 @@ func (s *Server) keyTypeOf(key string) string {
 	return t
 }
 
+// isHashKey reports whether key is a known hash parent — EXPLICIT index only,
+// no inference fallback. The fallback in keyTypeOf (prefix scan) cannot tell
+// hash fields (profile:1:theme) from flat colon keys (shadow:1, users:42:name),
+// and guessing wrong collapses 200 real keys into one phantom parent (caught
+// live by the shadow runner). Cold-restart consequence, documented: field paths
+// list un-collapsed until the next HSET re-tags the parent.
+func (s *Server) isHashKey(key string) bool {
+	if v, ok := s.keyTypes.Load(key); ok {
+		if t, ok := v.(string); ok && t == "hash" {
+			return true
+		}
+	}
+	return false
+}
+
 // assertKeyType enforces Redis type semantics using index first, value second.
 // Returns nil if key is absent (caller creates) or types match.
 func (s *Server) assertKeyType(key, want string) error {
