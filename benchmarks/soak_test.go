@@ -3,6 +3,7 @@
 package benchmarks
 
 import (
+	"encoding/csv"
 	"fmt"
 	"math/rand"
 	"os"
@@ -132,6 +133,33 @@ func TestSoak_FrontierCache_2min(t *testing.T) {
 	hitRate := float64(0)
 	if hits+misses > 0 {
 		hitRate = float64(hits) / float64(hits+misses) * 100
+	}
+
+	// Long-run artifact: append one summary row per run to SOAK_SAMPLE_FILE
+	// (CSV: ts,duration_s,sets,gets,hits,misses,errors,keys). This is what gets
+	// graphed after a 24h–7d cloud run — the in-CI default only smokes it.
+	// NOTE: a 24h+ soak must run on a cloud VM with real PG + CDC + external
+	// writers (see docc/CHAOS_AND_PG_REALITY.md). This laptop run proves the
+	// harness, not endurance.
+	if samplePath := os.Getenv("SOAK_SAMPLE_FILE"); samplePath != "" {
+		fh, err := os.OpenFile(samplePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			t.Logf("sample file: %v", err)
+		} else {
+			w := csv.NewWriter(fh)
+			_ = w.Write([]string{
+				time.Now().UTC().Format(time.RFC3339),
+				fmt.Sprintf("%.0f", duration.Seconds()),
+				fmt.Sprintf("%d", sets),
+				fmt.Sprintf("%d", gets),
+				fmt.Sprintf("%d", hits),
+				fmt.Sprintf("%d", misses),
+				fmt.Sprintf("%d", errors.Load()),
+				fmt.Sprintf("%d", len(store.FrontierPaths())),
+			})
+			w.Flush()
+			_ = fh.Close()
+		}
 	}
 
 	t.Logf("=== 2-MINUTE SOAK TEST (FrontierCache + Proof Engine) ===")
