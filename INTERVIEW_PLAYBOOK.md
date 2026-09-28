@@ -33,7 +33,9 @@ in-RAM map fed by write-through + PG/MySQL CDC). Match → 1.7µs return. 1-of-5
 dirty-propagation re-reduce, 7µs. PG is the source of truth; `CausalCrystal` (WAL DAG) is
 dev-only. Status: single-node pilot-ready (TLS+ACL wired with fail-fast boot, slot watchdog,
 5m snapshots, 13-check pilot list); NOT quorum-replicated, longest soak 2 min, MySQL = poller.
-Defaults: fail-OPEN reads (AP under partition); opt-in `max_staleness` fails reads closed.
+Defaults: binary fail-open; pilot config fail-closed (PG: slot-health oracle armed automatically
+with the watchdog — idle serves at lag ~0, proven-behind-or-blind fails; MySQL: `max_staleness`
+poll-health bound; dev: always open).
 Numbers: in-process (add 200–500µs network, 25–80ms CDC over VPC). Open gaps: Raft, binlog GA,
 7-day soak, RBAC/SSO. Entry points: `main.go`, `engine/incremental.go:ReduceIncremental`,
 `storage/sharded_frontier.go`, `protocol/resp3/server.go`, `replication/postgres.go`.
@@ -142,13 +144,16 @@ a 60s TTL. MySQL has the same shape via the polling `MySQLListener` (`replicatio
 
 ## 1.8 CAP in one breath (they WILL ask)
 You get 2 of 3: Consistency / Availability / Partition-tolerance. Wavicle's honest position:
-**AP by default, CP on demand.** Default reads are fail-OPEN: if CDC stalls, the frontier
+**AP by default, CP where armed.** Unconfigured reads are fail-OPEN: if CDC stalls, the frontier
 silently ages and matching vectors still return — that's availability-first behavior, and any
-doc revision claiming otherwise was wrong. The fix that makes CP real: the opt-in stale guard
-(`max_staleness`, `server.go:SetStaleGuard`) — proof-engine reads ERROR instead of serving when
-CDC has been silent too long. So: "AP out of the box, CP with one config line, and I can show
-you both." Single node ≈ 99.5% (≈3.65h/mo down). 3-node quorum math (Raft, not yet built): loss
-needs 2 of 3 down simultaneously: `3(0.005²)(0.995) + 0.005³ ≈ 7.46e-5` → 99.9925% (~39 min/yr).
+doc revision claiming otherwise was wrong. The fix that makes CP real: health-oracle fail-closed
+reads — PG fails reads only when the slot PROVES behind-or-blind (lag ≥ page bytes, inactive,
+missing), MySQL only when its poller goes silent past `max_staleness`. Idle-but-healthy always
+serves (lag ≈ 0, clean polls) — event-recency oracles that fail quiet streams were considered
+and rejected for exactly this reason. So: "AP out of the box, CP in pilot config, and I can show
+you both — including the test where a healthy-but-quiet stream serves." Single node ≈ 99.5%
+(≈3.65h/mo down). 3-node quorum math (Raft, not yet built): loss needs 2
+of 3 down simultaneously: `3(0.005²)(0.995) + 0.005³ ≈ 7.46e-5` → 99.9925% (~39 min/yr).
 Never claim quorum numbers as shipped — the math is provisioned, code is hashring routing only.
 
 ---
@@ -282,7 +287,10 @@ func (f *FrontierCache) VerifyVersionVector(entries map[string]core.Hash) bool {
     return true
 }
 ```
-Say: "a hash match IS a content match (SHA3), so matching fingerprints = provably fresh."
+Say: "a hash match IS a content match (SHA3), so matching fingerprints mean the cached value
+is fresh *relative to the frontier* — the in-RAM mirror of the database, not Postgres itself.
+Freshness against Postgres is bounded by CDC lag, and the stale guard turns 'bounded' into
+'refused' when the oracle fires."
 
 **2. Dirty propagation** (`engine/proof.go:47`):
 ```go
@@ -351,15 +359,22 @@ Benchmarks assert it (`0 B/op`). Prometheus histogram observe is the known alloc
 Yes, if unwatched — the scariest real risk. Math: 7.2GB/h at 4k w/s; 100GB in 13.9h. Defenses:
 continuous LSN flush (recycles WAL), disk checkpoint resume, `lag_bytes` alerts at 1GB/10GB,
 runbook slot-drop. *Follow-up: "Consumer down 24h?"* → drop slot, snapshot+reseed; say it.
+**Q8. "Echo suppression — why compare values AND timestamps?"**
+Write-through PG echo returns seconds later over CDC; naive re-append mints a new hash (clock in
+hash!) and pointlessly invalidates proofs. Guard: skip if `PhysicalTime` newer or value identical.
 **Q8b. "Write-through does PG-then-local. Process dies between them?"**
 Then PG has a write the cache never saw — the exact hole CDC was built for: on restart the
 listener resumes from its LSN checkpoint and replays the missed event (echo guard lets it
 through because nothing local is newer). Three nets, in order: (1) CDC replay from checkpoint,
 (2) `WriteThroughStore.GetCurrent` PG fallback seeds the cache on next miss, (3) the 30s
 revalidation net (`adapter.go`) catches anything both missed. No net is trusted alone.
-**Q8. "Echo suppression — why compare values AND timestamps?"**
-Write-through PG echo returns seconds later over CDC; naive re-append mints a new hash (clock in
-hash!) and pointlessly invalidates proofs. Guard: skip if `PhysicalTime` newer or value identical.
+**Q8c. "PG says A, frontier says B on the same key — who wins?"**
+Decided, not fixed: whoever arrived last wins the frontier (both paths append; higher clock or
+later arrival stands), and divergence heals toward PG — the 30s revalidation net compares and
+reseeds from PG, and CDC replay ordering converges concurrent cross-writer generations. What is
+NOT promised: per-key monotonicity across the DB boundary (the PG consistency test asserts
+validity + bounded visibility + convergence, explicitly not cross-boundary monotonicity —
+see its header). In-process, monotonic reads DO hold (checker proves it).
 **Q9. "SQL parser is a toy. Admit it."**
 Happily: only `SELECT cols FROM tbl WHERE id=X`, keys must be `table:id:column`. Joins need a real
 planner (Vitess-style). Claiming more is the fastest way to fail the loop.
@@ -368,10 +383,10 @@ Was a real bug (SADD merged into ZSETs). Fixed with the `keyTypes` index (Redis-
 index authoritative on write, shape re-verified on read. Empty-record ambiguity documented.
 
 ## C. Distributed systems
-**Q11. "CAP? What do you sacrifice?"** → §1.8: AP by default (fail-open reads), CP via
-opt-in `max_staleness` fail-closed guard (`TestStaleGuard_*` prove all four states: disabled,
-fresh, silent→STALE error, boot grace). If CDC stalls unguarded, vectors still match a stale
-frontier — say this BEFORE they trap you. Quorum math is provisioned, not shipped.
+**Q11. "CAP? What do you sacrifice?"** → §1.8: AP by default (fail-open reads), CP where
+armed — PG via slot-health oracle, MySQL via poll-health bound (`TestStaleGuard_PGSlotHealth`,
+`TestStaleGuard_MySQLPollHealth`, chaos stall drill). If CDC stalls unguarded, vectors still
+match a stale frontier — say this BEFORE they trap you. Quorum math is provisioned, not shipped.
 **Q12. "Hashring isn't replication. What dies with a node?"** → 1/N keyspace until reseed;
 at 1B scale that's a 50h incident without parallel reseed — hence quorum is next, hashring is
 sharding-only. Say both halves.
@@ -379,9 +394,10 @@ sharding-only. Say both halves.
 addresses, not cross-node consensus tokens. Cross-node agreement (future Raft) compares VALUES
 + versions, never raw hashes. Good catch answer.
 **Q14. "Linearizability?"** → Single-key read-your-write within a node (write updates frontier
-synchronously). Cross-node/external-write: bounded staleness = CDC lag, UNLESS `max_staleness`
-is armed — then overdue reads error instead of serving, which is fail-closed consistency, not
-linearizability. Don't claim linearizability globally; claim the exact contract.
+synchronously) + per-key monotonic reads in-process (checker-proven). Cross-node/external-write:
+bounded staleness = CDC lag, UNLESS the health oracle fires — then overdue reads error instead of
+serving, which is fail-closed consistency, not linearizability. Don't claim linearizability
+globally; claim the exact contract.
 
 ## D. Performance / benchmarking (where juniors die)
 **Q15. "Prove 7.9x isn't noise."** → `testing.B -count=6` + `benchstat`, p=0.002 on the
@@ -411,9 +427,16 @@ read-heavy service as sidecar, shadow-migrated (`wavicle-migrate` exit 0), then 
 memory, "AI resonance" positioning. Killing is the story of §4 in MAKING_HISTORY.
 **Q23. "Design-partner pitch, 30 seconds?"** → "Give me staging + one read-heavy endpoint. I run
 the 13-check pilot; you watch lag/hit-rate dashboards for a week. Rollback = point DNS back."
-**Q24. "Why you?"** → "Solo-built engine+protocol+CDC+benches; found 10 bugs by re-testing my own
-code (TOCTOU, WRONGTYPE empty replies, KEYS leaks, snapshot loss) and fixed each with a regression
-test. The repo shows the work, not claims."
+**Q24. "Why you?"** → "Solo-built engine+protocol+CDC+benches; found 17 bugs by re-testing my own
+code and fixed each with a regression test — including two my own consistency checker caught in
+my own harness. The repo shows the work, not claims."
+**Q25. "How is this different from ReadySet / mcrouter-style MySQL caches / RDI?"**
+Honest answer, three parts: (1) same CDC-stream insight — everyone converged on 'watch the
+database log instead of hand-invalidating'; no novelty claimed there. (2) What differs is
+read-time verification: cached values carry dependency hashes re-checked per read, plus
+incremental subtree re-reduce instead of whole-result recompute. (3) What I have NOT done:
+run them head-to-head — no benchmark against ReadySet exists in this repo, so I won't claim
+a speedup over them, only over cold recompute and TTL staleness windows. Say that verbatim.
 
 ---
 
@@ -432,8 +455,12 @@ test. The repo shows the work, not claims."
 | 9 | New cache leaked a goroutine per construction | `NewShardedFrontierCache` built a throwaway `FrontierCache` for its env limit | parse env directly |
 | 10 | MySQL table interpolated into SQL | config-trusted string in query | identifier allowlist like PG |
 | 11 | Identical SET minted new hash, nuked dependent proofs | clock+time in hash; only CDC echo guard deduped | write-path `sameAtomContent` dedup (deadline-aware) + `SameValueDedup` test |
-| 12 | Stalled CDC served confidently-stale reads (AP by default) | vectors match whatever the frontier holds | opt-in `max_staleness` fail-closed guard on all data reads + `TestStaleGuard_*` |
+| 12 | Stalled CDC served confidently-stale reads (AP by default) | vectors match whatever the frontier holds | health-oracle fail-closed guard (slot lag/page, poll silence) — NOT event recency, which fails quiet streams |
 | 13 | SHA3 inside shard lock held hundreds of ns per writer | conservative first version | hash-before-lock + `LogicalClock` guard (stale issue loses) + `ConcurrentSameKey` |
+| 14 | Checker flagged ghosts that were never written | MY harness recorded history AFTER publishing (queue→apply→observe→record inversion) | record atomically with the append under one mutex; order == apply order == history order |
+| 15 | Dev WAL replay took ~14s for 7.8MB, port dark | replay cost never measured; old "<2s per 1M atoms" claim untested | measured, claim killed, wrote it into the credibility doc as a false-claim example |
+| 16 | Dev-mode SETs cost ~58ms under load | per-write file Sync on Windows + growing WAL | documented as dev-only evidence FOR the no-WAL production design (prod: ~3µs) |
+| 17 | Lag metric labeled by table, unbounded | fresh `WithLabelValues` per table = series explosion | cap 64 + `_other` overflow; `LabelCardinalityBounded` test with 200 tables |
 
 Tell 2–3 max in the room. Each ends with the test name — that's what makes it credible.
 
@@ -507,7 +534,7 @@ can derive every answer from a hash comparison. Good luck, little brother. You'v
 > You asked: "lines, or the real machine?" This part is the machine. Each section = what
 > the code LITERALLY does, then a diagram you can redraw. File:line pointers included.
 
-## 10.1 The full machine (one diagram to rule them all)
+## 11.1 The full machine (one diagram to rule them all)
 
 ```mermaid
 flowchart TB
@@ -540,7 +567,7 @@ flowchart TB
     MIG -.->|KEYS+MGET diff| TLS
 ```
 
-## 10.2 Where a key lives (memory layout)
+## 11.2 Where a key lives (memory layout)
 
 Key → shard is pure arithmetic, no lookup:
 
@@ -567,7 +594,7 @@ Under the hood, per portion:
 - **ProofCache** (`engine/cache.go`): 64 shards × 2000 entries = 128k proofs max. Shard = `FastHash` (first 8 hash bytes, little-endian) % 64. Trap detail: `Get` takes the FULL write `Lock`, not RLock — because LRU `MoveToFront` mutates. `Set` overwrites in place or evicts the back when `len >= capacity`.
 - **Memory math** (`estimateAtomBytes`): 220 (struct+map+LRU) + `len(path)` + payload (`VString`: 16+len; `VBytes`: 24+len; other scalars: 16; composite expr: 48). Example: path 20B + 50B string → 220+20+66 = **306B accounted**; plan **~2x RSS** (Go map overhead) → 550–600B/key real.
 
-## 10.3 The proof tree under the microscope (1 changed of 50)
+## 11.3 The proof tree under the microscope (1 changed of 50)
 
 ```mermaid
 graph TD
@@ -592,7 +619,7 @@ Mechanics (`engine/compose.go`, `incremental.go`, `proof.go`):
 - **Merkle caching**: `ComputeMerkleRoot` returns cached root if `MerkleValid`; any dirty mark clears it up the chain. Next clean read re-arms it.
 - **Locking**: each `MaterializedProof` has its own `mu` (`proof.go:120`) — concurrent GETs on DIFFERENT keys never touch each other; same-key concurrent reads serialize on that proof's lock (correctness over parallelism, per-key).
 
-## 10.4 CDC pipeline (sequence, with the two guards that matter)
+## 11.4 CDC pipeline (sequence, with the two guards that matter)
 
 ```mermaid
 sequenceDiagram
@@ -618,7 +645,7 @@ Under the hood (`replication/postgres.go`, `main.go:runCDCApplier`):
 - DELETE → tombstone atom (`VNull`), so `GET` returns nil and `EXISTS` returns 0 through the SAME version-vector path (no special case in the engine).
 - MySQL (`replication/mysql.go`): same `ChangeEvent` shape; `SELECT * WHERE id > watermark ORDER BY id LIMIT 1000` per table per tick (default 500ms); table names allowlisted like PG.
 
-## 10.5 Snapshot + memory-ceiling lifecycles (state machines)
+## 11.5 Snapshot + memory-ceiling lifecycles (state machines)
 
 ```mermaid
 stateDiagram-v2
@@ -647,7 +674,7 @@ Snapshot v2 line format (one JSON per line — `cat data/frontier.snapshot`):
 lists/sets/zsets use `"value_type":"list|set|zset"` + `"data":{...}` payload. Scalars, lists,
 sets, zsets survive; tombstones and expired never persist (by design — they're deletions).
 
-## 10.6 Connection lifecycle (auth → ACL → TX)
+## 11.6 Connection lifecycle (auth → ACL → TX)
 
 ```mermaid
 stateDiagram-v2
@@ -669,7 +696,7 @@ Under the hood (`server.go:handleConnection`):
 - **Type index** (`keyTypes sync.Map`): set on every write, deleted on DEL/empty/FLUSHDB. Reads consult index FIRST (fast path), fall back to value-shape inference for cold/CDC keys and re-populate. Guards ALWAYS re-verify shape before `WRONGTYPE` — index is acceleration, never sole authority.
 - Telemetry caution (senior trap): `RequestsTotal` labels by command (bounded, safe); `ReplicationLagMs` labels by TABLE (unbounded if tables grow — real cardinality risk, flagged).
 
-## 10.7 Billion-key machine (how the cluster looks at scale)
+## 11.7 Billion-key machine (how the cluster looks at scale)
 
 ```mermaid
 flowchart LR
@@ -685,3 +712,26 @@ Read it as: hashring for ROUTING (3.83% imbalance measured), PG for TRUTH, snaps
 in parallel (never one 42-minute stream), quorum replication BEFORE 1B (else one dead node =
 91M cold keys = 50h single-thread reseed). This diagram is your answer to "how does it scale" —
 and to "what breaks," which is the same question asked twice.
+
+---
+
+# PART 12 — TWO-PAGE CHEAT SHEET (memorize this, reference the rest)
+
+## Page 1: hook + derivations
+- **Hook:** receipts re-checked per read against the local frontier (write-through + one CDC stream); 1.7µs warm, 7µs incremental, no TTL/DEL/pub-sub. In-process caveat out loud, every time.
+- **50×30ns = 1.5µs:** FastPath1 cost derived, not memorized. Single key: 1 lookup + 1 compare ≈ 90ns.
+- **O(m) / O(k log d) / O(n):** full vector scan / k dirty leaves up d parents via PathToNode jumps / cold compose. Worst case degrades to O(n) — say it.
+- **Availability:** single 99.5% = 3.65h/mo; quorum math 99.9925% = 39min/yr (NOT shipped).
+- **WAL death:** 4k×500B = 7.2GB/h → 100GB in 13.9h; alert 1GB, page 10GB, human drops slot.
+- **Stale window:** 60s/0.05s = 1200x smaller than TTL; ~7k vs 8.64M stale-prone reads/day at 10k RPS.
+- **Billion:** 550B/key → 650GB → 11×64GB; snapshot 42.5min single-stream → per-node; node loss = 50h reseed → quorum first.
+
+## Page 2: top 8 answers
+1. Reinvented invalidation? → moved N hand paths → 1 stream incl. migrations (§0.1).
+2. TTL? → heuristic; we verify indefinitely-cached values in 1.7µs (Q1).
+3. Locks? → 32 shards + hash-before-lock + clock guard, 2.16x measured (Q3).
+4. CDC stall? → AP default; slot-health/poll-health fail-closed; quiet serves (Q11).
+5. Echo/dual-write? → value+time guard; CDC replay + PG fallback + 30s net (Q8–Q8c).
+6. Same-key PG-vs-frontier? → last arrival wins, heals toward PG; no cross-boundary monotonic promise (Q8c).
+7. Competitors? → same CDC insight; differ on per-read verification + subtree re-reduce; no head-to-head run (Q25).
+8. Why you? → 17 self-found bugs, each with a regression test (Q24 + Part 7).
