@@ -427,9 +427,9 @@ read-heavy service as sidecar, shadow-migrated (`wavicle-migrate` exit 0), then 
 memory, "AI resonance" positioning. Killing is the story of §4 in MAKING_HISTORY.
 **Q23. "Design-partner pitch, 30 seconds?"** → "Give me staging + one read-heavy endpoint. I run
 the 13-check pilot; you watch lag/hit-rate dashboards for a week. Rollback = point DNS back."
-**Q24. "Why you?"** → "Solo-built engine+protocol+CDC+benches; found 17 bugs by re-testing my own
+**Q24. "Why you?"** → "Solo-built engine+protocol+CDC+benches; found 18 bugs by re-testing my own
 code and fixed each with a regression test — including two my own consistency checker caught in
-my own harness. The repo shows the work, not claims."
+my own harness, and one my own shadow runner caught live. The repo shows the work, not claims."
 **Q25. "How is this different from ReadySet / mcrouter-style MySQL caches / RDI?"**
 Honest answer, three parts: (1) same CDC-stream insight — everyone converged on 'watch the
 database log instead of hand-invalidating'; no novelty claimed there. (2) What differs is
@@ -461,6 +461,7 @@ a speedup over them, only over cold recompute and TTL staleness windows. Say tha
 | 15 | Dev WAL replay took ~14s for 7.8MB, port dark | replay cost never measured; old "<2s per 1M atoms" claim untested | measured, claim killed, wrote it into the credibility doc as a false-claim example |
 | 16 | Dev-mode SETs cost ~58ms under load | per-write file Sync on Windows + growing WAL | documented as dev-only evidence FOR the no-WAL production design (prod: ~3µs) |
 | 17 | Lag metric labeled by table, unbounded | fresh `WithLabelValues` per table = series explosion | cap 64 + `_other` overflow; `LabelCardinalityBounded` test with 200 tables |
+| 18 | Shadow runner compared 1 phantom key, not 200 | KEYS collapse heuristic merged `shadow:N` into parent "shadow" | collapse ONLY on explicit type-index `hash` (`isHashKey`); `FlatColonKeysIntact` test; inference documented as unfixable |
 
 Tell 2–3 max in the room. Each ends with the test name — that's what makes it credible.
 
@@ -490,8 +491,11 @@ proof cache), 32-shard frontier with LRU/TTL/snapshot-v2/5m ticker, Redis-7 subs
 (List/Set/ZSet/Stream/counters/MULTI) with type index, multi-user ACL file + TLS termination
 (both fail-fast wired in `main.go` — verified live: bad file/cert = exit 1), PG CDC with LSN
 checkpoints + slot watchdog (WARN 1GB / PAGE 10GB, never auto-drops), MySQL poller, shadow-migrate
-prover, stale-guard fail-closed reads (`WAVICLE_MAX_STALENESS`), billion-key capacity model.
-Longest soak: 2 minutes. Replication: hashring routing only.
+prover (one-shot + `--continuous` shadow mode with 50ms deadlines, JSONL + report),
+`wavicle-bench` (p50/p99 vs any RESP target) + `wavicle-cdcbench` (real visibility CSVs),
+`/healthz` + `/readyz` (same oracles as the stale guard), govulncheck clean (x/text bumped),
+13-check staging pilot; billion-key capacity model.
+Longest soak: 2 minutes (+ live 30-minute shadow run in progress — report attaches to pitch on completion).
 
 **Explicitly NOT done (say before they ask):** Raft quorum (math provisioned §4.3), true MySQL
 binlog tail, 7-day soak + chaos drills, RBAC/SSO/audit log, rate limiting, SOC2, cloud-hardware
