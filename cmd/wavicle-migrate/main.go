@@ -30,6 +30,7 @@ func main() {
 	pattern := flag.String("pattern", "*", "KEYS pattern")
 	count := flag.Int("count", 10000, "max keys to compare")
 	timeout := flag.Duration("timeout", 5*time.Second, "dial timeout")
+	authPass := flag.String("auth", "", "password sent as AUTH on both ends (pilot stacks require it)")
 	continuous := flag.Bool("continuous", false, "loop sweeps until -duration or SIGINT (shadow-read mode)")
 	interval := flag.Duration("interval", 30*time.Second, "delay between sweeps in continuous mode")
 	duration := flag.Duration("duration", 0*time.Second, "total run time in continuous mode (0 = until SIGINT)")
@@ -38,12 +39,18 @@ func main() {
 	reportPath := flag.String("report", "shadow-report.json", "write summary report JSON here on exit (continuous mode)")
 	flag.Parse()
 
+	// Pilot stacks require AUTH; handshake once per connection when set.
+	authPassword = *authPass
+
 	if !*continuous {
 		runOnce(*src, *dst, *pattern, *count, *timeout)
 		return
 	}
 	runContinuous(*src, *dst, *pattern, *count, *timeout, *interval, *duration, *getTimeout, *logPath, *reportPath)
 }
+
+// authPassword, when non-empty, is sent as AUTH immediately after connect.
+var authPassword string
 
 func runOnce(src, dst, pattern string, count int, timeout time.Duration) {
 	keys, err := respKeys(src, pattern, timeout)
@@ -86,7 +93,19 @@ func dial(addr string, timeout time.Duration) (net.Conn, *bufio.Reader, *bufio.W
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return c, bufio.NewReader(c), bufio.NewWriter(c), nil
+	r, w := bufio.NewReader(c), bufio.NewWriter(c)
+	if authPassword != "" {
+		_ = c.SetDeadline(time.Now().Add(timeout))
+		hdr, _, err := sendInline(w, r, "AUTH "+authPassword)
+		if err != nil || !strings.HasPrefix(hdr, "+OK") {
+			c.Close()
+			if err == nil {
+				err = fmt.Errorf("AUTH rejected: %q", hdr)
+			}
+			return nil, nil, nil, err
+		}
+	}
+	return c, r, w, nil
 }
 
 func sendInline(w *bufio.Writer, r *bufio.Reader, line string) (string, []string, error) {
