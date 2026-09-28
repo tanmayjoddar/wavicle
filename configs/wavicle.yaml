@@ -31,6 +31,9 @@ db:
   dsn: "postgres://wavicle:wavicle@db:5432/wavicle?sslmode=disable"
   replication_slot: "wavicle_slot"
   publication: "wavicle_proofs"
+  # Fail-closed reads for pilot: refuse proof-engine reads when CDC has been
+  # silent longer than this (stale frontier = lies). "" = fail-open.
+  max_staleness: "2s"
   table_mappings:
     - table: "users"
       key_template: "users:${id}"

@@ -15,6 +15,7 @@ services:
       - WAVICLE_METRICS_ENABLED=true
       - WAVICLE_AUTH_PASSWORD=testpass
       - WAVICLE_MAX_CONNS=20
+      - WAVICLE_MAX_STALENESS=2s
     volumes:
       - wavicle-data:/var/lib/wavicle
 
