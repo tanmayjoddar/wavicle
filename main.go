@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -105,11 +106,11 @@ func main() {
 		// Runs even if the listener failed — a dead listener IS the emergency.
 		// Its shared state ALSO arms fail-closed reads: slot-proven behind or
 		// blind fails reads; unknown (boot) and healthy-idle (lag ~0) serve.
+		slotName := cfg.DB.ReplicationSlot
+		if slotName == "" {
+			slotName = "wavicle_slot"
+		}
 		if cfg.SlotMon.Enabled && cfg.DB.DSN != "" {
-			slotName := cfg.DB.ReplicationSlot
-			if slotName == "" {
-				slotName = "wavicle_slot"
-			}
 			monInterval := 15 * time.Second
 			if d, err := time.ParseDuration(cfg.SlotMon.Interval); err == nil && d > 0 {
 				monInterval = d
@@ -128,6 +129,30 @@ func main() {
 			log.Printf("Slot monitor watching %q every %v (warn %dB, page %dB)",
 				slotName, monInterval, cfg.SlotMon.WarnBytes, cfg.SlotMon.PageBytes)
 			pgFailClosed, pgPageBytes = true, cfg.SlotMon.PageBytes
+		}
+
+		// Readiness probes for /readyz (same oracles as the stale guard, so
+		// the probe and the gate can never disagree about health).
+		readyDB, err := sql.Open("postgres", cfg.DB.DSN)
+		if err != nil {
+			log.Printf("Readiness DB handle: %v", err)
+		} else {
+			telemetry.RegisterReadyCheck("postgres", func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				return readyDB.PingContext(ctx)
+			})
+			slot, page := slotName, cfg.SlotMon.PageBytes
+			dsn := cfg.DB.DSN
+			telemetry.RegisterReadyCheck("slot", func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				info, err := replication.QuerySlotInfo(ctx, dsn, slot)
+				if lvl, msg := replication.ClassifySlot(info, err, page, page); lvl == replication.SlotPage {
+					return fmt.Errorf("%s", msg)
+				}
+				return nil
+			})
 		}
 	} else if cfg.DB.Type == "mysql" {
 		log.Printf("Initializing MySQL polling CDC (tables: %v)", cfg.MySQL.Tables)
@@ -171,9 +196,18 @@ func main() {
 		if cfg.DB.MaxStaleness != "" {
 			if d, err := time.ParseDuration(cfg.DB.MaxStaleness); err == nil && d > 0 {
 				mysqlMaxSilence = d
+				lastOK, maxSil := mysqlLastOK, d
+				telemetry.RegisterReadyCheck("mysql-poller", func() error {
+					if last := lastOK.Load(); last != 0 && time.Since(time.Unix(0, last)) > maxSil {
+						return fmt.Errorf("poller silent over %v", maxSil)
+					}
+					return nil
+				})
 			} else {
 				log.Printf("Invalid max_staleness %q, MySQL stale guard disabled (fail-open)", cfg.DB.MaxStaleness)
 			}
+		} else {
+			log.Printf("MySQL max_staleness unset: poller health unmonitored (fail-open)")
 		}
 	} else {
 		// Dev mode: full CausalCrystal with WAL, compaction, and causal DAG.
