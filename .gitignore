@@ -1,5 +1,7 @@
 *.log
 *.exe
+*.exe~
+*~
 /wavicle
 /wavicle-migrate
 /wavicle-cli
