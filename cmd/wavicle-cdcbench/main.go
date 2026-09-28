@@ -42,7 +42,10 @@ var (
 	csvPath = flag.String("csv", "cdc-lag.csv", "delta CSV output")
 	timeout = flag.Duration("timeout", 10*time.Second, "per-poll give-up (counts as +inf sample)")
 	pollGap = flag.Duration("poll-gap", 5*time.Millisecond, "delay between GET polls")
+	authPass = flag.String("auth", "", "password sent as AUTH (pilot stacks require it)")
 )
+
+var authPassword string
 
 func respGet(addr, key string, perCall time.Duration) (string, error) {
 	c, err := net.DialTimeout("tcp", addr, 3*time.Second)
@@ -51,8 +54,21 @@ func respGet(addr, key string, perCall time.Duration) (string, error) {
 	}
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(perCall))
-	fmt.Fprintf(c, "GET %s\r\n", key)
 	r := bufio.NewReader(c)
+	if authPassword != "" {
+		w := bufio.NewWriter(c)
+		fmt.Fprintf(w, "AUTH %s\r\n", authPassword)
+		_ = w.Flush()
+		line, err := r.ReadString('\n')
+		if err != nil || !strings.HasPrefix(strings.TrimRight(line, "\r\n"), "+OK") {
+			if err == nil {
+				err = fmt.Errorf("AUTH rejected: %q", line)
+			}
+			return "", err
+		}
+		_ = c.SetDeadline(time.Now().Add(perCall))
+	}
+	fmt.Fprintf(c, "GET %s\r\n", key)
 	line, err := r.ReadString('\n')
 	if err != nil {
 		return "", err
@@ -100,6 +116,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "-dsn is required")
 		os.Exit(1)
 	}
+	authPassword = *authPass
 	// Operator-supplied identifiers go straight into SQL: allowlist them.
 	for _, s := range []string{*table, *column} {
 		if !validIdent(s) {

@@ -14,8 +14,12 @@ import (
 
 const version = "1.0.0"
 
+// authFlag is package-level so runCommand/runREPL share it.
+var authFlag *string
+
 func main() {
 	addr := flag.String("p", "6379", "Server address (port, or host:port)")
+	authFlag = flag.String("auth", "", "Password sent as AUTH first (required when the server has auth enabled)")
 	showHelp := flag.Bool("help", false, "Show help")
 	showVersion := flag.Bool("version", false, "Show version")
 	flag.Parse()
@@ -58,12 +62,35 @@ func runCommand(addr, line string) error {
 	}
 	defer conn.Close()
 
+	if *authFlag != "" {
+		if err := doAuth(conn, *authFlag); err != nil {
+			return err
+		}
+	}
+
 	_, err = fmt.Fprintf(conn, "%s\r\n", line)
 	if err != nil {
 		return fmt.Errorf("send failed — %v", err)
 	}
 
 	return printResponse(conn, os.Stdout)
+}
+
+// doAuth performs the AUTH handshake and requires +OK.
+func doAuth(conn net.Conn, password string) error {
+	if _, err := fmt.Fprintf(conn, "AUTH %s\r\n", password); err != nil {
+		return fmt.Errorf("auth send failed — %v", err)
+	}
+	br := bufio.NewReader(conn)
+	resp, err := br.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("auth read failed — %v", err)
+	}
+	resp = strings.TrimRight(resp, "\r\n")
+	if resp != "+OK" {
+		return fmt.Errorf("auth rejected — %s", resp)
+	}
+	return nil
 }
 
 func runREPL(addr string) {
@@ -78,6 +105,13 @@ func runREPL(addr string) {
 		os.Exit(1)
 	}
 	defer conn.Close()
+
+	if *authFlag != "" {
+		if err := doAuth(conn, *authFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "(error) %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	fmt.Fprintf(os.Stderr, "Connected.\n")
 
