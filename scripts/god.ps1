@@ -32,7 +32,7 @@ param(
   [string]$Publication   = 'wavicle_pub',
   [string]$Slot          = 'wavicle_slot',
   [int]$WavPort          = 6390,
-  [int]$MetricsPort      = 8090,
+  [int]$MetricsPort      = 8091,
   [int]$KeysPerRange     = 1000,
   [int]$ExtWriteMs       = 200,
   [int]$AppWritesPerSec  = 5,
@@ -112,7 +112,7 @@ function Psql([string]$sql) {
   $ErrorActionPreference = 'Continue'
   $out = & docker exec -e PGAPPNAME=soak_ctl $PgContainer psql -U postgres -d soak -At -v ON_ERROR_STOP=1 -c $sql 2>&1
   if ($LASTEXITCODE -ne 0) { throw "psql failed ($LASTEXITCODE): $out | sql=$sql" }
-  return @($out | ForEach-Object { "$_" })
+    return ,@($out | ForEach-Object { "$_" })
 }
 function Docker-Quiet { $ErrorActionPreference = 'Continue'; & docker @args 2>&1 | Out-Null; return $LASTEXITCODE }
 
@@ -238,20 +238,17 @@ function Stop-ExtWriter {
 }
 function Start-ExtWriter {
   Stop-ExtWriter
-  $every = [string]::Format($inv, '{0:0.###}', $ExtWriteMs / 1000.0)
-  $sqlf = "$RunDir\ext-writer.sql"
-  $lines = @('\o /dev/null',
-    "update soak_kv set val='ext-'||nextval('soak_seq'), updated_at=now() where id = case when random()<0.5 then 1+floor(random()*$N)::int else 2*$N+1+floor(random()*$N)::int end\watch $every")
-  Set-Content -Path $sqlf -Value $lines -Encoding ascii
+  $delay = [string]::Format($inv, '{0:0.###}', $ExtWriteMs / 1000.0)
   $before = [int64](Psql 'select last_value from soak_seq')[0]
-  $script:extProc = Start-Process -FilePath 'docker' -PassThru -WindowStyle Hidden -RedirectStandardInput $sqlf `
+  $call = "`"call soak_writer($N, $delay)`""
+  $script:extProc = Start-Process -FilePath 'docker' -PassThru -WindowStyle Hidden `
     -RedirectStandardOutput "$RunDir\ext-writer.out.log" -RedirectStandardError "$RunDir\ext-writer.err.log" `
-    -ArgumentList @('exec','-i','-e','PGAPPNAME=soak_ext_writer',$PgContainer,'psql','-U','postgres','-d','soak','-q','-f','-')
+    -ArgumentList @('exec','-e','PGAPPNAME=soak_ext_writer',$PgContainer,'psql','-U','postgres','-d','soak','-q','-c',$call)
   Start-Sleep -Seconds 4
   $after = [int64](Psql 'select last_value from soak_seq')[0]
-  if ($after -le $before) { throw "external writer is not advancing soak_seq (psql \watch via stdin failed?) - see $RunDir\ext-writer.err.log" }
+  if ($after -le $before) { throw "external writer is not advancing soak_seq - see $RunDir\ext-writer.err.log" }
   $script:writerOn = $true; $script:lastSeq = $after
-  Log-Event "external writer started (every ${every}s, ids ext+contested, backend=soak_ext_writer)"
+  Log-Event "external writer started (procedure soak_writer, every ${delay}s, backend=soak_ext_writer)"
 }
 
 # ---------------------------------------------------------------- workload + checks
@@ -294,9 +291,9 @@ function Do-Tx {
 function Do-Churn {
   for ($i=0; $i -lt 20; $i++) {
     try {
-      $c = New-Object Net.Sockets.TcpClient; $c.ReceiveTimeout = 2000; $c.Connect('127.0.0.1', $WavPort)
-      $s = $c.GetStream(); $b = [Text.Encoding]::ASCII.GetBytes("*1`r`n`$4`r`nPING`r`n"); $s.Write($b, 0, $b.Length)
-      $buf = New-Object byte[] 16; [void]$s.Read($buf, 0, 16); $c.Close()
+      $cl = New-Object Net.Sockets.TcpClient; $cl.ReceiveTimeout = 2000; $cl.Connect('127.0.0.1', $WavPort)
+      $s = $cl.GetStream(); $b = [Text.Encoding]::ASCII.GetBytes("*1`r`n`$4`r`nPING`r`n"); $s.Write($b, 0, $b.Length)
+      $buf = New-Object byte[] 16; [void]$s.Read($buf, 0, 16); $cl.Close()
     } catch { if (-not $script:drill) { $C.churnFail++ } }
   }
 }
@@ -331,12 +328,12 @@ function Do-Sweep {
   $C.sweeps++; $script:sweepSeq++
   $script:lastSweepClean = ($clean -and $script:pend.Count -eq 0)
 }
-function Do-Canary([bool]$inDrill) {
+function Do-Canary([bool]$inDrill, [int]$timeoutSec = 15) {
   $script:canaryCtr++; $v = "canary-$RunId-$($script:canaryCtr)"
   $sw = [Diagnostics.Stopwatch]::StartNew()
   [void](Psql "update soak_kv set val='$v', updated_at=now() where id=$CanaryId")
   $lag = -1.0
-  while ($sw.Elapsed.TotalSeconds -lt 15) {
+  while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
     $g = Wav-Get "soak_kv:${CanaryId}:val"
     if ($g.k -eq 'ok' -and $g.v -eq $v) { $lag = $sw.Elapsed.TotalMilliseconds; break }
     Start-Sleep -Milliseconds 5
@@ -348,10 +345,10 @@ function Do-Canary([bool]$inDrill) {
 }
 function Do-Sample {
   $el = [int]$script:clock.Elapsed.TotalSeconds
-  $rss = 0; $thr = 0; $hnd = 0
+  $rssNow = 0; $thr = 0; $hnd = 0
   if ($script:wav) { $p = Get-Process -Id $script:wav.Id -ErrorAction SilentlyContinue
-    if ($p) { $rss = $p.WorkingSet64; $thr = $p.Threads.Count; $hnd = $p.HandleCount
-      if ($script:wavUp) { $Rss.Add([pscustomobject]@{ t = $el; pid = $p.Id; rss = $rss }) } } }
+    if ($p) { $rssNow = $p.WorkingSet64; $thr = $p.Threads.Count; $hnd = $p.HandleCount
+      if ($script:wavUp) { $Rss.Add([pscustomobject]@{ t = $el; pid = $p.Id; rss = $rssNow }) } } }
   $slotLag = -1; $slotAct = 'n/a'; $wal = 0; $dbs = 0; $wr = -1; $ws = -1; $seq = -1
   if (-not $script:pgDown) {
   $o = (Psql $SampleSql)[0].Split('|')
@@ -359,7 +356,7 @@ function Do-Sample {
   if ($slotLag -gt $C.maxSlotLag) { $C.maxSlotLag = $slotLag }
   if (-not $script:drill) {
     if ($slotAct -eq 'none') { $C.slotBad++; Log-Event 'SLOT MISSING outside drill' }
-    elseif ($slotAct -ne 't' -and $script:wavUp) { $C.slotBad++; Log-Event "SLOT INACTIVE outside drill (active=$slotAct)" }
+    elseif ($slotAct -ne 'true' -and $script:wavUp) { $C.slotBad++; Log-Event "SLOT INACTIVE outside drill (active=$slotAct)" }
     if ($script:writerOn) {
       if ($wr -ne 1) { $C.censusFail++; Log-Event "WRITER CENSUS: $wr backends (want 1) - restarting writer"; Start-ExtWriter }
       elseif ($seq -le $script:lastSeq) { $C.harnessFail++; Log-Event "WRITER NOT ADVANCING seq=$seq last=$($script:lastSeq)" }
@@ -382,7 +379,7 @@ function Do-Sample {
   $free = [math]::Round((Get-PSDrive ($RunDir.Substring(0,1))).Free / 1GB, 1)
   if ($free -lt $C.minFreeGB) { $C.minFreeGB = $free }
   if ((Get-CimInstance Win32_OperatingSystem).LastBootUpTime -ne $script:bootTime) { $C.rebooted++; $script:bootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime; Log-Event 'MACHINE REBOOT DETECTED' }
-  $row = "{0:yyyy-MM-ddTHH:mm:ssZ},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},{16},{17},{18},{19}" -f [DateTime]::UtcNow, $el, $(if ($script:wav) { $script:wav.Id } else { 0 }), $rss, $thr, $hnd, $slotLag, $slotAct, $wal, $dbs, $wr, $ws, $err, $mem, $lagM, $conn, $ready, $free, $script:pend.Count, $script:drill
+  $row = "{0:yyyy-MM-ddTHH:mm:ssZ},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},{16},{17},{18},{19}" -f [DateTime]::UtcNow, $el, $(if ($script:wav) { $script:wav.Id } else { 0 }), $rssNow, $thr, $hnd, $slotLag, $slotAct, $wal, $dbs, $wr, $ws, $err, $mem, $lagM, $conn, $ready, $free, $script:pend.Count, $script:drill
   Add-Content -Path "$RunDir\metrics.csv" -Value $row
 }
 function Do-Census {
@@ -412,16 +409,16 @@ function Pump {
   }
   try {
     if ($script:wavUp) {
-      if ($ms -ge $script:tRead) { Do-Reads; $script:tRead = $ms + 1000 }
-      if (-not $script:quiet -and $ms -ge $script:tApp) { Do-AppWrites; $script:tApp = $ms + 1000 }
-      if (-not $script:quiet -and $ms -ge $script:tTx -and -not $script:drill) { Do-Tx; $script:tTx = $ms + 10000 }
-      if (-not $script:pgDown -and $ms -ge $script:tSweep) { Do-Sweep; $script:tSweep = $ms + $(if ($script:recovering) { 3000 } else { 5000 }) }
-      if (-not $script:quiet -and -not $script:drill -and -not $script:pgDown -and $ms -ge $script:tCanary) { Do-Canary $false | Out-Null; $script:tCanary = $ms + 10000 }
-      if (-not $script:drill -and $ms -ge $script:tChurn) { Do-Churn; $script:tChurn = $ms + 30000 }
+      if ($ms -ge $script:tRead) { $script:tRead = $ms + 1000; Do-Reads }
+      if (-not $script:quiet -and $ms -ge $script:tApp) { $script:tApp = $ms + 1000; Do-AppWrites }
+      if (-not $script:quiet -and $ms -ge $script:tTx -and -not $script:drill) { $script:tTx = $ms + 10000; Do-Tx }
+      if (-not $script:pgDown -and $ms -ge $script:tSweep) { $script:tSweep = $ms + $(if ($script:recovering) { 3000 } else { 5000 }); Do-Sweep }
+      if (-not $script:quiet -and -not $script:drill -and -not $script:pgDown -and $ms -ge $script:tCanary) { $script:tCanary = $ms + 10000; Do-Canary $false | Out-Null }
+      if (-not $script:drill -and $ms -ge $script:tChurn) { $script:tChurn = $ms + 30000; Do-Churn }
     }
-    if ($ms -ge $script:tSample) { Do-Sample; $script:tSample = $ms + 30000 }
-    if (-not $script:drill -and $ms -ge $script:tCensus) { Do-Census; $script:tCensus = $ms + 300000 }
-    if ($ms -ge $script:tStatus) { Write-Status; $script:tStatus = $ms + 30000 }
+    if ($ms -ge $script:tSample) { $script:tSample = $ms + 30000; Do-Sample }
+    if (-not $script:drill -and $ms -ge $script:tCensus) { $script:tCensus = $ms + 300000; Do-Census }
+    if ($ms -ge $script:tStatus) { $script:tStatus = $ms + 30000; Write-Status }
   } catch { $C.harnessFail++; Log-Event "HARNESS EXCEPTION: $_" }
 }
 function Wait-Converged([int]$maxSec) {
@@ -605,12 +602,17 @@ try {
   if ($rc -ne 0) { throw 'docker run postgres failed' }
   $sw = [Diagnostics.Stopwatch]::StartNew(); $ready = $false
   while ($sw.Elapsed.TotalSeconds -lt 120) {
-    $ErrorActionPreference = 'Continue'; $logs = (& docker logs $PgContainer 2>&1 | Out-String); $ErrorActionPreference = 'Stop'
-    if (([regex]::Matches($logs, 'ready to accept connections')).Count -ge 2) { $ready = $true; break }
+    $ErrorActionPreference = 'Continue'
+    & docker exec $PgContainer pg_isready -h 127.0.0.1 -U postgres -d soak 2>&1 | Out-Null
+    $rc2 = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($rc2 -eq 0) { $ready = $true; break }
     Start-Sleep -Seconds 2
   }
   if (-not $ready -or -not (Wait-PgBack 30)) { throw 'postgres did not become ready' }
   [void](Psql "create table soak_kv(id int primary key, val text not null, updated_at timestamptz not null default now()); alter table soak_kv replica identity full; create sequence soak_seq; insert into soak_kv select g,'seed-'||g,now() from generate_series(1,$($N*3+1)) g; create publication $Publication for table soak_kv")
+    $proc = 'create or replace procedure soak_writer(n int, delay float8) language plpgsql as $body$ declare rid int; begin loop if random() < 0.5 then rid := 1 + floor(random()*n)::int; else rid := 2*n + 1 + floor(random()*n)::int; end if; update soak_kv set val = ''ext-'' || nextval(''soak_seq''), updated_at = now() where id = rid; commit; perform pg_sleep(delay); end loop; end $body$'
+  [void](Psql $proc)
   Log-Event "postgres ready, schema seeded ($($N*3+1) rows), publication=$Publication"
 
   # ---- wavicle + writers
@@ -618,7 +620,7 @@ try {
   $r0 = Wait-WavReady 120
   if ($r0 -lt 0) { throw "wavicle never became ready (see $RunDir\wavicle-1-initial.err.log). Check -PgDsn / replication DSN" }
   $script:wavUp = $true
-  $lag0 = Do-Canary $true
+  $lag0 = Do-Canary $true 60
   if ($lag0 -lt 0) { throw "FATAL: initial CDC canary never became visible. Check publication/slot names vs deployments/postgres/init.sql, and that Wavicle maps soak_kv:<id>:val" }
   Log-Event "initial CDC canary visible in $([int]$lag0)ms - topology proven"
   Start-ExtWriter
@@ -692,7 +694,7 @@ finally {
   $verdict = if ($failed.Count -eq 0) { 'PASS' } else { 'FAIL' }
   $crit | ConvertTo-Json -Depth 3 | Set-Content "$RunDir\verdict.json" -Encoding ascii
   $md = @("# Wavicle soak verdict: $verdict", '', "duration=$Duration run=$RunId host=loopback single-node dev laptop", '', '| id | criterion | status | detail |', '|---|---|---|---|')
-  foreach ($c in $crit) { $md += "| $($c.id) | $($c.name) | $($c.status) | $($c.detail) |" }
+  foreach ($cr in $crit) { $md += "| $($cr.id) | $($cr.name) | $($cr.status) | $($cr.detail) |" }
   Set-Content "$RunDir\report.md" -Value $md -Encoding ascii
   Write-Host ''; Write-Host "================ SOAK VERDICT: $verdict ================"
   $crit | Format-Table id, status, name, detail -AutoSize -Wrap | Out-String | Write-Host
