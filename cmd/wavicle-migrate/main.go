@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -33,9 +34,14 @@ func main() {
 	authPass := flag.String("auth", "", "password sent as AUTH on both ends (pilot stacks require it)")
 	continuous := flag.Bool("continuous", false, "loop sweeps until -duration or SIGINT (shadow-read mode)")
 	interval := flag.Duration("interval", 30*time.Second, "delay between sweeps in continuous mode")
+	flag.DurationVar(interval, "sweep-interval", 30*time.Second, "alias of -interval")
 	duration := flag.Duration("duration", 0*time.Second, "total run time in continuous mode (0 = until SIGINT)")
 	getTimeout := flag.Duration("get-timeout", 50*time.Millisecond, "hard per-GET deadline; overruns count as Wavicle-side failures, never block the loop")
+	flag.DurationVar(getTimeout, "op-timeout", 50*time.Millisecond, "alias of -get-timeout")
+	sweepTimeout := flag.Duration("sweep-timeout", 90*time.Second, "hard per-sweep deadline; overruns abort the sweep, log sweep_timeout, continue looping")
 	logPath := flag.String("log", "", "append JSON mismatch lines here (continuous mode)")
+	flag.StringVar(logPath, "mismatch-log", "", "alias of -log")
+	heartbeatPath := flag.String("heartbeat", "", "append 'alive sweep N t=Xs' per sweep here (proves liveness live, not at the end)")
 	reportPath := flag.String("report", "shadow-report.json", "write summary report JSON here on exit (continuous mode)")
 	flag.Parse()
 
@@ -46,7 +52,7 @@ func main() {
 		runOnce(*src, *dst, *pattern, *count, *timeout)
 		return
 	}
-	runContinuous(*src, *dst, *pattern, *count, *timeout, *interval, *duration, *getTimeout, *logPath, *reportPath)
+	runContinuous(*src, *dst, *pattern, *count, *timeout, *interval, *duration, *getTimeout, *sweepTimeout, *logPath, *heartbeatPath, *reportPath)
 }
 
 // authPassword, when non-empty, is sent as AUTH immediately after connect.
@@ -228,6 +234,125 @@ func escapeArg(s string) string {
 	return s
 }
 
+// pidLock is the on-disk record proving one comparer owns a report path.
+type pidLock struct {
+	PID       int    `json:"pid"`
+	StartedAt string `json:"started_at"`
+	Heartbeat string `json:"heartbeat"`
+}
+
+// staleLockAfter bounds heartbeat staleness: older means the owner is dead or
+// wedged either way, and a loud takeover beats a silent shared report.
+const staleLockAfter = 5 * time.Minute
+
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	// Signal 0 performs no delivery; error means no such live process.
+	// PLATFORM HONESTY: on Windows this syscall reports "not supported",
+	// i.e. always false — so it is only EVER a positive hint, never the
+	// deciding vote. The heartbeat below is the binding rule on all OSes.
+	if err := p.Signal(syscall.Signal(0)); err != nil {
+		return false
+	}
+	return true
+}
+
+func readLock(path string) (pidLock, bool) {
+	var l pidLock
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return l, false
+	}
+	if err := json.Unmarshal(b, &l); err != nil {
+		return pidLock{}, false
+	}
+	return l, true
+}
+
+func writeLock(path string, l pidLock) error {
+	b, err := json.Marshal(l)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// acquireLock claims path or refuses loudly. Returns a release func removing
+// the file on clean exit, plus a beat func refreshing it per sweep.
+// THE RULE (same on every OS): a FRESH heartbeat refuses, period — liveness
+// of the writer is proven by recency, not by PID games. A STALE heartbeat
+// (older than staleLockAfter) takes over loudly, even if the PID looks alive
+// (PID reuse makes "alive" untrustworthy on its own). The PID is recorded for
+// human forensics (kill it yourself if you disagree with a takeover).
+// Simultaneous starters are serialized by O_EXCL create: exactly one wins,
+// the loser sees a brand-new file (no heartbeat yet = treat as fresh = refuse).
+func acquireLock(path string) (release func(), beat func(), err error) {
+	now := time.Now().UTC()
+	own := pidLock{PID: os.Getpid(), StartedAt: now.Format(time.RFC3339), Heartbeat: now.Format(time.RFC3339)}
+	ownBytes, _ := json.Marshal(own)
+	fh, openErr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if openErr == nil {
+		// We won the race: sole owner.
+		_, _ = fh.Write(ownBytes)
+		_ = fh.Close()
+		fmt.Printf("lock %s acquired by pid %d\n", path, own.PID)
+	} else {
+		// Someone was here first (or concurrently): read and judge. Retry
+		// briefly — the winner may still be writing its first bytes, and a
+		// half-read must refuse (safe direction), not clobber.
+		var prev pidLock
+		var ok bool
+		for i := 0; i < 6; i++ {
+			prev, ok = readLock(path)
+			if ok {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		fresh := false
+		if ok {
+			if hb, perr := time.Parse(time.RFC3339, prev.Heartbeat); perr == nil {
+				fresh = now.Sub(hb) < staleLockAfter
+			} else {
+				fresh = true // just-born file, no heartbeat yet — refuse, don't race it
+			}
+		} else {
+			fresh = true // unreadable counts as fresh: refuse rather than clobber blindly
+		}
+		alive := ok && pidAlive(prev.PID)
+		if fresh || alive {
+			return nil, nil, fmt.Errorf(
+				"another shadow comparer (pid %d, started %s, heartbeat %s) owns report lock %s. "+
+					"Two writers corrupt one report — kill it or use a different -report path",
+				prev.PID, prev.StartedAt, prev.Heartbeat, path)
+		}
+		fmt.Printf("TAKEOVER stale lock %s from pid %d (started %s, last heartbeat %s) — previous run crashed or was killed\n",
+			path, prev.PID, prev.StartedAt, prev.Heartbeat)
+		if err := writeLock(path, own); err != nil {
+			return nil, nil, fmt.Errorf("cannot write lock %s: %w", path, err)
+		}
+		fmt.Printf("lock %s acquired by pid %d\n", path, own.PID)
+	}
+	var mu sync.Mutex
+	beat = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		own.Heartbeat = time.Now().UTC().Format(time.RFC3339)
+		_ = writeLock(path, own)
+	}
+	return func() { _ = os.Remove(path) }, beat, nil
+}
+
 // mismatchLine is one JSONL record in the mismatch log.
 type mismatchLine struct {
 	Timestamp   string  `json:"ts"`
@@ -252,6 +377,7 @@ type shadowReport struct {
 	SourceP99Ms     float64 `json:"source_p99_ms"`
 	TargetP50Ms     float64 `json:"target_p50_ms"`
 	TargetP99Ms     float64 `json:"target_p99_ms"`
+	SweepTimeouts   int64   `json:"sweep_timeouts"`
 	MismatchLog     string  `json:"mismatch_log"`
 	GeneratedAt     string  `json:"generated_at"`
 }
@@ -279,12 +405,28 @@ func (h *latHist) percentile(p float64) float64 {
 }
 
 // runContinuous loops KEYS sweeps until duration elapses or SIGINT arrives.
-// A dead/hung target can NEVER crash or stall it: every Wavicle GET carries a
-// hard deadline, failures are counters + log lines, and shutdown always writes
-// the summary report first.
-func runContinuous(src, dst, pattern string, count int, timeout, interval, duration, getTimeout time.Duration, logPath, reportPath string) {
+// No failure mode stalls it: every Wavicle GET carries a hard deadline, each
+// SWEEP carries a hard deadline (overruns abort with sweep_timeout, counted in
+// the report), failures are counters + log lines, and shutdown always writes
+// the summary report first. Every sweep logs one timing line, always — a hang
+// is visible live in the log instead of discovered at the end.
+func runContinuous(src, dst, pattern string, count int, timeout, interval, duration, getTimeout, sweepTimeout time.Duration, logPath, heartbeatPath, reportPath string) {
+	// PID lock, tied to the report path: two comparers must never share one
+	// report/JSONL pair (Sep-29 lesson — it halves apparent sweep cadence and
+	// corrupts the report). Refuse loudly on a LIVE owner; take over — loudly —
+	// a stale one (dead pid or heartbeat older than 5m).
+	lockPath := reportPath + ".lock"
+	if reportPath == "" {
+		log.Fatal("continuous mode requires -report (PID lock is tied to it)")
+	}
+	release, beat, err := acquireLock(lockPath)
+	if err != nil {
+		log.Fatalf("REFUSING TO START: %v", err)
+	}
+	defer release()
+	refreshLock := beat
 	started := time.Now()
-	var compared, mismatches, werrs, sweeps atomic.Int64
+	var compared, mismatches, werrs, sweeps, sweepTimeouts atomic.Int64
 	srcHist, dstHist := &latHist{}, &latHist{}
 
 	var logMu sync.Mutex
@@ -297,6 +439,29 @@ func runContinuous(src, dst, pattern string, count int, timeout, interval, durat
 			os.Exit(1)
 		}
 		defer logFh.Close()
+	}
+	var hbMu sync.Mutex
+	var hbFh *os.File
+	if heartbeatPath != "" {
+		var err error
+		hbFh, err = os.OpenFile(heartbeatPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "heartbeat log: %v\n", err)
+			os.Exit(1)
+		}
+		defer hbFh.Close()
+	}
+	heartbeat := func(n int64, took time.Duration, note string) {
+		line := fmt.Sprintf("%s alive sweep=%d t=%.0fs %s\n",
+			time.Now().UTC().Format(time.RFC3339), n, time.Since(started).Seconds(), note)
+		fmt.Print(line)
+		refreshLock()
+		if hbFh == nil {
+			return
+		}
+		hbMu.Lock()
+		fmt.Fprint(hbFh, line)
+		hbMu.Unlock()
 	}
 	logMismatch := func(m mismatchLine) {
 		if logFh == nil {
@@ -316,42 +481,73 @@ func runContinuous(src, dst, pattern string, count int, timeout, interval, durat
 		deadline = started.Add(duration)
 	}
 
-	sweep := func() {
-		keys, err := respKeys(src, pattern, timeout)
-		if err != nil {
-			fmt.Printf("sweep: source KEYS failed (%v) — skipping sweep, loop survives\n", err)
-			return
-		}
-		sort.Strings(keys)
-		if len(keys) > count {
-			keys = keys[:count]
-		}
-		sweeps.Add(1)
-		for _, k := range keys {
-			a, aLat, errA := respGet(src, k, timeout, getTimeout)
-			srcHist.add(aLat)
-			b, bLat, errB := respGet(dst, k, timeout, getTimeout)
-			dstHist.add(bLat)
-			compared.Add(1)
-			if errB != nil {
-				werrs.Add(1)
+	sweep := func() (timedOut bool) {
+		n := sweeps.Add(1) // count ATTEMPTED sweeps first: a run that compares
+		// nothing must report honestly, never a 100% match rate over zero
+		// comparisons (lesson of the Sep-29 overnight run).
+		t0 := time.Now()
+		done := make(chan struct{})
+		var keys []string
+		var keysErr error
+		var c, mm int
+		go func() {
+			defer close(done)
+			var err error
+			keys, err = respKeys(src, pattern, timeout)
+			if err != nil {
+				keysErr = err
+				return
 			}
-			if errA != nil || errB != nil || a != b {
-				mismatches.Add(1)
-				te := ""
+			sort.Strings(keys)
+			if len(keys) > count {
+				keys = keys[:count]
+			}
+			for _, k := range keys {
+				a, aLat, errA := respGet(src, k, timeout, getTimeout)
+				srcHist.add(aLat)
+				b, bLat, errB := respGet(dst, k, timeout, getTimeout)
+				dstHist.add(bLat)
+				compared.Add(1)
+				c++
 				if errB != nil {
-					te = errB.Error()
+					werrs.Add(1)
 				}
-				logMismatch(mismatchLine{
-					Timestamp:   time.Now().UTC().Format(time.RFC3339),
-					Key:         k,
-					Source:      a,
-					Target:      b,
-					TargetError: te,
-					SourceMs:    float64(aLat.Microseconds()) / 1000,
-					TargetMs:    float64(bLat.Microseconds()) / 1000,
-				})
+				if errA != nil || errB != nil || a != b {
+					mismatches.Add(1)
+					mm++
+					te := ""
+					if errB != nil {
+						te = errB.Error()
+					}
+					logMismatch(mismatchLine{
+						Timestamp:   time.Now().UTC().Format(time.RFC3339),
+						Key:         k,
+						Source:      a,
+						Target:      b,
+						TargetError: te,
+						SourceMs:    float64(aLat.Microseconds()) / 1000,
+						TargetMs:    float64(bLat.Microseconds()) / 1000,
+					})
+				}
 			}
+		}()
+		select {
+		case <-done:
+			took := time.Since(t0)
+			heartbeat(n, took, fmt.Sprintf("keys=%d compared=%d mismatches=%d", len(keys), c, mm))
+			if keysErr != nil {
+				fmt.Printf("sweep %d: source KEYS failed (%v) — skipping sweep, loop survives\n", n, keysErr)
+			}
+			return false
+		case <-time.After(sweepTimeout):
+			// The abandoned goroutine still finishes on its own deadlines
+			// (every GET is bounded) and its partial counters stand as-is.
+			sweepTimeouts.Add(1)
+			took := time.Since(t0)
+			heartbeat(n, took, "SWEEP_TIMEOUT — aborted, counters kept, looping on")
+			fmt.Printf("sweep %d: exceeded %v — aborted (sweep_timeout #%d), loop survives\n",
+				n, sweepTimeout, sweepTimeouts.Load())
+			return true
 		}
 	}
 
@@ -384,6 +580,7 @@ loop:
 		SourceP99Ms:     srcHist.percentile(99),
 		TargetP50Ms:     dstHist.percentile(50),
 		TargetP99Ms:     dstHist.percentile(99),
+		SweepTimeouts:   sweepTimeouts.Load(),
 		MismatchLog:     logPath,
 		GeneratedAt:     time.Now().UTC().Format(time.RFC3339),
 	}
