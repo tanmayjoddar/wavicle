@@ -682,7 +682,7 @@ finally {
   Add-Crit 'C08' "all 5 drills ran and recovered within ${RtoSec}s" (PF ($allRan -and $allOk)) (($DrillRes | ForEach-Object { "$($_.name):ok=$($_.ok),rto=$($_.rto_s)s,conv=$($_.converge_s)s" }) -join ' | ')
   Add-Crit 'C09' 'zero errors outside drills (errors_total, refused reads, nil reads, IO, SET fails)' (PF (($C.errorsOut + $C.refusedOut + $C.nilOut + $C.ioOut + $C.setErrOut + $C.churnFail) -eq 0)) "errors_total_delta=$($C.errorsOut) refused=$($C.refusedOut) nil=$($C.nilOut) io=$($C.ioOut) set_err=$($C.setErrOut) churn_fail=$($C.churnFail)"
   Add-Crit 'C10' 'healthy-but-idle stream keeps serving (quiet drill)' (PF ($C.quietViol -eq 0 -and ($names -contains 'quiet-idle'))) "violations=$($C.quietViol)"
-  $g = Rss-Growth
+  $g = $null; try { $g = Rss-Growth } catch { Log-Event "Rss-Growth failed: $_" }
   if ($null -eq $g) { Add-Crit 'C11' "RSS growth <= ${RssGrowthPct}pct" 'SKIP' 'no process segment >= 10 min (run longer than ~1h for a meaningful leak signal)' }
   else { Add-Crit 'C11' "RSS growth <= ${RssGrowthPct}pct (worst process lifetime, linear fit)" (PF ($g -le $RssGrowthPct)) "worst_growth=$([math]::Round($g,1))pct" }
   Add-Crit 'C12' 'census clean (1 Wavicle, 1 writer backend, 1 walsender) and harness healthy' (PF ($C.censusFail -eq 0 -and $C.harnessFail -eq 0)) "census_fail=$($C.censusFail) harness_fail=$($C.harnessFail)"
